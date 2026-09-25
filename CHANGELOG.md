@@ -1,5 +1,11 @@
 # 更新日志
 
+## v0.1.13 — 2026-09-26（UTC+8）
+
+- 回放 message 时补发 `response.output_text.delta`。ZCode 只把该事件追加为可见正文，原先只有 `output_item.done` 时界面为空。
+- 每个非空 `output_text` 片段单独发送，并带上 `content_index`。空片段、refusal 和 reasoning 不补正文增量。
+- 上游流式仍是整段读完再回放，这次只补客户端可见的文本事件。
+
 ## v0.1.12 — 2026-09-25（UTC+8）
 
 - 仅修改插件：声明 CPA 已有的 `codex` 输入/输出格式，复用宿主 Claude↔Codex 转换；不新增私有转换器，不修改 CPA 主程序。

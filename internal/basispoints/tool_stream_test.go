@@ -111,6 +111,39 @@ func TestNativeToolStreamCanBeConsumedWithoutTrimmingOrDuplication(t *testing.T)
 	}
 }
 
+func TestMessageStreamEmitsOutputTextDelta(t *testing.T) {
+	message := map[string]any{
+		"type": "message", "id": "msg_visible", "role": "assistant", "status": "completed",
+		"content": []any{
+			map[string]any{"type": "output_text", "text": "pong"},
+			map[string]any{"type": "refusal", "refusal": "skip"},
+			map[string]any{"type": "output_text", "text": ""},
+			map[string]any{"type": "output_text", "text": "again"},
+		},
+	}
+	reasoning := map[string]any{"type": "reasoning", "id": "rs_hidden", "summary": []any{}}
+	response := map[string]any{"id": "resp_visible", "status": "completed", "output": []any{reasoning, message}}
+	events := clientStreamEvents(t, syntheticStream(response))
+	var deltas []string
+	var contentIndexes []float64
+	for _, event := range events {
+		kind := stringValue(event["type"])
+		switch kind {
+		case "response.output_text.delta":
+			if event["item_id"] != "msg_visible" || event["output_index"] != float64(1) {
+				t.Fatalf("text delta identity lost: %#v", event)
+			}
+			deltas = append(deltas, event["delta"].(string))
+			contentIndexes = append(contentIndexes, event["content_index"].(float64))
+		case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
+			t.Fatalf("reasoning was copied into a text delta: %#v", event)
+		}
+	}
+	if !reflect.DeepEqual(deltas, []string{"pong", "again"}) || !reflect.DeepEqual(contentIndexes, []float64{0, 1}) {
+		t.Fatalf("visible text deltas = %#v indexes %#v", deltas, contentIndexes)
+	}
+}
+
 func TestExecutorNativeToolRoundTrip(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		for _, toolType := range []string{"function", "custom"} {

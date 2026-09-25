@@ -926,6 +926,8 @@ func syntheticStream(response map[string]any) []byte {
 					emit(event+".delta", map[string]any{"output_index": index, "item_id": item["id"], "delta": text})
 				}
 				emit(event+".done", map[string]any{"output_index": index, "item_id": item["id"], field: text})
+			} else if stringValue(item["type"]) == "message" {
+				emitMessageTextDeltas(emit, index, item)
 			}
 			emit("response.output_item.done", map[string]any{"output_index": index, "item": item})
 		}
@@ -937,6 +939,28 @@ func syntheticStream(response map[string]any) []byte {
 	emit(terminalEvent, map[string]any{"response": response})
 	builder.WriteString("data: [DONE]\n\n")
 	return []byte(builder.String())
+}
+
+func emitMessageTextDeltas(emit func(string, map[string]any), outputIndex int, item map[string]any) {
+	content, _ := item["content"].([]any)
+	contentIndex := 0
+	for _, value := range content {
+		part := objectValue(value)
+		if part == nil || stringValue(part["type"]) != "output_text" {
+			continue
+		}
+		text, _ := part["text"].(string)
+		if text == "" {
+			continue
+		}
+		emit("response.output_text.delta", map[string]any{
+			"output_index":  outputIndex,
+			"content_index": contentIndex,
+			"item_id":       item["id"],
+			"delta":         text,
+		})
+		contentIndex++
+	}
 }
 
 func writeSSE(builder *strings.Builder, event string, value any) {
