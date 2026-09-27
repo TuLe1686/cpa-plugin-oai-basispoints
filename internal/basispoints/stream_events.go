@@ -40,6 +40,7 @@ type streamDelivery struct {
 	pacer         *deltaPacer
 	pacerStop     chan struct{}
 	pacerOnce     sync.Once
+	writeMu       sync.Mutex
 }
 
 func newStreamDelivery(format string, start func(), write func([]byte) error) *streamDelivery {
@@ -47,15 +48,13 @@ func newStreamDelivery(format string, start func(), write func([]byte) error) *s
 }
 
 // enableSmoothing 接入正文平滑器；在首个文本增量前调用一次。
-// 后台协程按配置节奏发送拆小的 delta，非增量帧经 drainPacer 保序。
+// 后台协程按配置节奏发送拆小的 delta，非增量帧经 flushAndWait 保序。
 func (d *streamDelivery) enableSmoothing(pacer *deltaPacer) {
 	d.pacerOnce.Do(func() {
 		d.pacer = pacer
 		d.pacerStop = make(chan struct{})
 		go pacer.run(func(piece string) error {
-			pacer.mu.Lock()
-			index, content, item := pacer.currentOutputIndex, pacer.currentContentIndex, pacer.currentItemID
-			pacer.mu.Unlock()
+			index, content, item := pacer.identity()
 			return d.emitDirect(map[string]any{"type": "response.output_text.delta", "output_index": index, "content_index": content, "item_id": item, "delta": piece})
 		}, d.pacerStop)
 	})
@@ -317,7 +316,7 @@ func (d *streamDelivery) validateFinal(response map[string]any) error {
 	return nil
 }
 
-// drainPacer 结束放行协程并等它把积压发完；drain 后到达的增量走直发。
+// drainPacer 结束放行协程并等它把积压发完；仅在流终局调用。
 func (d *streamDelivery) drainPacer() {
 	if d.pacer == nil {
 		return
@@ -332,7 +331,8 @@ func (d *streamDelivery) drainPacer() {
 }
 
 func (d *streamDelivery) emit(value map[string]any) error {
-	// 平滑器只接管文本增量帧；其余帧先排空积压正文再直通，顺序不变。
+	// 平滑器只接管文本增量帧；其余帧等积压正文全部写出再直通，
+	// 放行协程保持存活，后续增量继续走平滑。
 	if d.pacer != nil && stringValue(value["type"]) == "response.output_text.delta" {
 		if text, ok := value["delta"].(string); ok && text != "" {
 			d.pacer.setIdentity(value)
@@ -340,13 +340,17 @@ func (d *streamDelivery) emit(value map[string]any) error {
 			return nil
 		}
 	}
-	d.drainPacer()
+	if d.pacer != nil {
+		d.pacer.flushAndWait()
+	}
 	return d.emitDirect(value)
 }
 
-// emitDirect 是唯一的实际写出路径；平滑协程与冲刷后的直发都走这里，
-// 避免拆小的 delta 再被 emit 拦回队列。
+// emitDirect 是唯一的实际写出路径；平滑协程与冲刷后的直发都走这里。
+// 放行协程与调用方可能并发到达（flushAndWait 超时兜底直通），写出互斥。
 func (d *streamDelivery) emitDirect(value map[string]any) error {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
 	frame := cloneObject(value)
 	frame["sequence_number"] = d.sequence
 	d.sequence++

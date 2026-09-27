@@ -197,3 +197,118 @@ func TestSmoothedDeliveryWritesDeltasBeforeTerminal(t *testing.T) {
 		t.Fatal("no delta index recorded")
 	}
 }
+
+// flushAndWait 后协程必须保活：后续增量继续被拆块放行。
+func TestDeltaPacerSurvivesFlushAndWait(t *testing.T) {
+	pacer := newDeltaPacer(true, 4, 1)
+	stop := make(chan struct{})
+	var mu sync.Mutex
+	var out []string
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		pacer.run(func(piece string) error {
+			mu.Lock()
+			out = append(out, piece)
+			mu.Unlock()
+			return nil
+		}, stop)
+	}()
+	pacer.queueDelta("first-burst")
+	deadline := time.After(3 * time.Second)
+	for {
+		mu.Lock()
+		total := 0
+		for _, piece := range out {
+			total += len(piece)
+		}
+		mu.Unlock()
+		if total == len("first-burst") {
+			mu.Lock()
+			out = nil
+			mu.Unlock()
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("first burst never drained")
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	pacer.flushAndWait()
+	pacer.queueDelta("second-burst")
+	for {
+		mu.Lock()
+		total := 0
+		for _, piece := range out {
+			total += len(piece)
+		}
+		mu.Unlock()
+		if total == len("second-burst") {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("pacer did not survive flushAndWait")
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	pacer.close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("close did not stop run loop")
+	}
+}
+
+// 端到端回归：多个 message 片段经边界帧分隔时，全部增量都被拆小，
+// 不再出现 v0.2.6 的「首个 done 帧后大块直发」。
+func TestSmoothedDeliveryPacesAcrossBoundaryFrames(t *testing.T) {
+	var mu sync.Mutex
+	var frames []string
+	delivery := newStreamDelivery("openai-response", func() {}, func(frame []byte) error {
+		mu.Lock()
+		frames = append(frames, string(frame))
+		mu.Unlock()
+		return nil
+	})
+	delivery.enableSmoothing(newDeltaPacer(true, 4, 1))
+	delivery.committed = true
+	emit := func(value map[string]any) {
+		t.Helper()
+		if err := delivery.emit(value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	emit(map[string]any{"type": "response.output_item.added", "output_index": 0, "item": map[string]any{"type": "message", "id": "msg_1"}})
+	emit(map[string]any{"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "item_id": "msg_1", "delta": "part-one-text"})
+	emit(map[string]any{"type": "response.output_text.done", "output_index": 0, "content_index": 0, "item_id": "msg_1", "text": "part-one-text"})
+	emit(map[string]any{"type": "response.output_text.delta", "output_index": 0, "content_index": 1, "item_id": "msg_1", "delta": "part-two-text"})
+	emit(map[string]any{"type": "response.output_text.done", "output_index": 0, "content_index": 1, "item_id": "msg_1", "text": "part-two-text"})
+	delivery.drainPacer()
+	mu.Lock()
+	defer mu.Unlock()
+	wire := strings.Join(frames, "") + "data: [DONE]\n\n"
+	var text string
+	pieces := 0
+	var pieceSizes []int
+	for _, event := range clientStreamEvents(t, []byte(wire)) {
+		if event["type"] == "response.output_text.delta" {
+			piece := len(event["delta"].(string))
+			pieces++
+			pieceSizes = append(pieceSizes, piece)
+			text += event["delta"].(string)
+		}
+	}
+	if text != "part-one-textpart-two-text" {
+		t.Fatalf("content broken: %q", text)
+	}
+	if pieces < 7 {
+		t.Fatalf("boundary frame killed pacing: pieces=%d sizes=%v", pieces, pieceSizes)
+	}
+	for _, size := range pieceSizes {
+		if size > 16 {
+			t.Fatalf("piece escaped pacing: sizes=%v", pieceSizes)
+		}
+	}
+}
