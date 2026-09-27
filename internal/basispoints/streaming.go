@@ -109,6 +109,9 @@ func (s *Service) executeStream(request ExecutorRequest, body map[string]any, c 
 	delivery := newStreamDelivery(request.Format, func() { ready <- nil }, func(frame []byte) error {
 		return s.call("host.stream.emit", map[string]any{"stream_id": request.StreamID, "payload": frame}, nil)
 	})
+	if cfg := s.config(); cfg.SmoothStream {
+		delivery.enableSmoothing(newDeltaPacer(true, cfg.SmoothChunkChars, cfg.SmoothIntervalMs))
+	}
 	go func() {
 		defer run.finish()
 		response, err := s.readStreamingResponse(request, body, c, run, delivery)

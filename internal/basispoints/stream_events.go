@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 )
 
 type streamedPart struct {
@@ -36,10 +37,26 @@ type streamDelivery struct {
 	messages      map[int]*streamedMessage
 	terminal      bool
 	sentinel      bool
+	pacer         *deltaPacer
+	pacerStop     chan struct{}
+	pacerOnce     sync.Once
 }
 
 func newStreamDelivery(format string, start func(), write func([]byte) error) *streamDelivery {
 	return &streamDelivery{format: format, start: start, write: write, knownMessages: map[int]string{}, knownParts: map[[2]int]bool{}, messages: map[int]*streamedMessage{}}
+}
+
+// enableSmoothing 接入正文平滑器；在首个文本增量前调用一次。
+// 后台协程按配置节奏发送拆小的 delta，非增量帧经 flushPacer 保序。
+func (d *streamDelivery) enableSmoothing(pacer *deltaPacer) {
+	d.pacerOnce.Do(func() {
+		d.pacer = pacer
+		d.pacerStop = make(chan struct{})
+		go pacer.run(func(piece string) error {
+			frame := map[string]any{"type": "response.output_text.delta", "output_index": pacer.currentOutputIndex, "content_index": pacer.currentContentIndex, "item_id": pacer.currentItemID, "delta": piece}
+			return d.emit(frame)
+		}, d.pacerStop)
+	})
 }
 
 func streamEventError() error {
@@ -298,7 +315,29 @@ func (d *streamDelivery) validateFinal(response map[string]any) error {
 	return nil
 }
 
+// stopPacer 结束放行协程；剩余积压已在调用前冲刷。
+func (d *streamDelivery) stopPacer() {
+	if d.pacer == nil {
+		return
+	}
+	d.pacer.close()
+	select {
+	case <-d.pacerStop:
+	default:
+		close(d.pacerStop)
+	}
+}
+
 func (d *streamDelivery) emit(value map[string]any) error {
+	// 平滑器只接管文本增量帧；其余帧先冲刷积压正文再直通，顺序不变。
+	if d.pacer != nil && stringValue(value["type"]) == "response.output_text.delta" {
+		if text, ok := value["delta"].(string); ok && text != "" {
+			d.pacer.setIdentity(value)
+			d.pacer.queueDelta(text)
+			return nil
+		}
+	}
+	d.flushPacer()
 	frame := cloneObject(value)
 	frame["sequence_number"] = d.sequence
 	d.sequence++
@@ -313,6 +352,19 @@ func (d *streamDelivery) emit(value map[string]any) error {
 	return d.emitBytes(payload)
 }
 
+// flushPacer 立即放出全部积压正文；终态、工具与错误帧都先经过这里。
+func (d *streamDelivery) flushPacer() {
+	if d.pacer == nil {
+		return
+	}
+	for _, text := range d.pacer.flush() {
+		frame := map[string]any{"type": "response.output_text.delta", "output_index": d.pacer.currentOutputIndex, "content_index": d.pacer.currentContentIndex, "item_id": d.pacer.currentItemID, "delta": text}
+		if err := d.emit(frame); err != nil {
+			return
+		}
+	}
+}
+
 func (d *streamDelivery) emitBytes(payload []byte) error {
 	if err := d.write(payload); err != nil {
 		d.disconnected = true
@@ -322,6 +374,8 @@ func (d *streamDelivery) emitBytes(payload []byte) error {
 }
 
 func (d *streamDelivery) finish(response map[string]any) error {
+	d.flushPacer()
+	d.stopPacer()
 	if !d.committed {
 		d.committed = true
 		d.start()
@@ -383,6 +437,8 @@ func (d *streamDelivery) finish(response map[string]any) error {
 }
 
 func (d *streamDelivery) fail(err error) error {
+	d.flushPacer()
+	d.stopPacer()
 	kind, message, errorType := "stream_failed", "Basis Points stream failed after response delivery began", "api_error"
 	var api *APIError
 	if errors.As(err, &api) {

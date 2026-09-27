@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	Version        = "0.2.3"
+	Version        = "0.2.4"
 	Provider       = "oai-basispoints"
 	AuthProviderID = "codex"
 	PluginID       = Provider
@@ -121,6 +121,9 @@ type Config struct {
 	MaxResponseBytes          int               `yaml:"max_response_bytes" json:"max_response_bytes"`
 	AuthMode                  string            `yaml:"auth_mode" json:"auth_mode"`
 	ToolsVersionID            string            `yaml:"tools_version_id" json:"tools_version_id"`
+	SmoothStream              bool              `yaml:"smooth_stream" json:"smooth_stream"`
+	SmoothChunkChars          int               `yaml:"smooth_chunk_chars" json:"smooth_chunk_chars"`
+	SmoothIntervalMs          int               `yaml:"smooth_interval_ms" json:"smooth_interval_ms"`
 }
 
 func defaultConfig() Config {
@@ -134,6 +137,9 @@ func defaultConfig() Config {
 		TimeoutSeconds:            300,
 		MaxResponseBytes:          64 << 20,
 		AuthMode:                  "chatgpt",
+		SmoothStream:              true,
+		SmoothChunkChars:          8,
+		SmoothIntervalMs:          20,
 	}
 }
 
@@ -169,6 +175,12 @@ func (c *Config) normalize() error {
 	}
 	if c.MaxResponseBytes < 64<<10 || c.MaxResponseBytes > 128<<20 {
 		return fail(400, "invalid_config", "max_response_bytes must be between 64 KiB and 128 MiB")
+	}
+	if c.SmoothChunkChars < 0 || c.SmoothChunkChars > 256 {
+		return fail(400, "invalid_config", "smooth_chunk_chars must be between 0 and 256")
+	}
+	if c.SmoothIntervalMs < 0 || c.SmoothIntervalMs > 1000 {
+		return fail(400, "invalid_config", "smooth_interval_ms must be between 0 and 1000")
 	}
 	seen := map[string]bool{}
 	models := make([]string, 0, len(c.Models))

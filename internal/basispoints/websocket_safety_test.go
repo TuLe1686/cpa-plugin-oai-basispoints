@@ -93,6 +93,8 @@ func TestWebSocketSubmittedFailuresNeverFallBack(t *testing.T) {
 					defer server.Close()
 					svc := NewService()
 					svc.cfg.ResponsesURL = server.URL
+					// 平滑器只改变到达节奏；本文件断言回退与重放语义，关闭以保持时序稳定。
+					svc.cfg.SmoothStream = false
 					if mode == "size_limit" {
 						svc.cfg.MaxResponseBytes = 3000
 					}
