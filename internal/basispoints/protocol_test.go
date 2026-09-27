@@ -58,7 +58,7 @@ func TestPrepareResponsesBodyStripsToolsAndUsesNaturalLanguageCatalog(t *testing
 	}
 }
 
-func TestTransportCodeUsesToolAndArgsAndPreservesNativeItem(t *testing.T) {
+func TestTransportUsesReferencesAndPreservesNativeItem(t *testing.T) {
 	source := map[string]any{
 		"tools": []any{map[string]any{
 			"type": "function",
@@ -80,7 +80,7 @@ func TestTransportCodeUsesToolAndArgsAndPreservesNativeItem(t *testing.T) {
 		"references": []any{"Tokyo weather"},
 		"arguments": string(jsonBytes(map[string]any{
 			"summary": "Get current weather for Tokyo",
-			"code":    string(jsonBytes(map[string]any{"tool": "get_weather", "args": map[string]any{"city": "Tokyo"}})),
+			"code":    string(jsonBytes(map[string]any{"city": "Tokyo"})), "references": []any{"get_weather"},
 		})),
 	}
 	response := map[string]any{"output": []any{native}}
@@ -111,7 +111,7 @@ func TestTransportCodeUsesToolAndArgsAndPreservesNativeItem(t *testing.T) {
 			"call_id": "call_native_weather",
 			"output":  "18°C",
 		},
-	}, clientToolSpecs(source))
+	})
 	if !reflect.DeepEqual(items[0], native) {
 		t.Fatalf("replayed native item = %#v, want %#v", items[0], native)
 	}
@@ -215,7 +215,7 @@ func TestAuthParseExpandsCodexFileIntoNativeAndBasisPointsAuths(t *testing.T) {
 }
 
 func TestServiceUsesCodexAuthParserAndBasisPointsExecutorIdentifiers(t *testing.T) {
-	service := NewService()
+	service := newHTTPTestService()
 	authIdentifier, err := service.Handle("auth.identifier", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -248,7 +248,7 @@ func TestExecuteBuildsAuthenticatedBasisPointsBody(t *testing.T) {
 	}
 	rawRequest := jsonBytes(requestBody)
 	storage := jsonBytes(map[string]any{"type": "codex", "access_token": token, "account_id": "wrong-file-id"})
-	service := NewService()
+	service := newHTTPTestService()
 	var seenHeaders map[string][]string
 	var seenBody map[string]any
 	service.SetHost(func(method string, payload any, out any) error {

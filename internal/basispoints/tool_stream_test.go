@@ -139,7 +139,8 @@ func TestMessageStreamEmitsOutputTextDelta(t *testing.T) {
 			t.Fatalf("reasoning was copied into a text delta: %#v", event)
 		}
 	}
-	if !reflect.DeepEqual(deltas, []string{"pong", "again"}) || !reflect.DeepEqual(contentIndexes, []float64{0, 1}) {
+	// 上游 v0.1.14+ 保留原始 content 下标：空片段占位不压缩索引。
+	if !reflect.DeepEqual(deltas, []string{"pong", "again"}) || !reflect.DeepEqual(contentIndexes, []float64{0, 3}) {
 		t.Fatalf("visible text deltas = %#v indexes %#v", deltas, contentIndexes)
 	}
 }
@@ -158,7 +159,7 @@ func TestExecutorNativeToolRoundTrip(t *testing.T) {
 					native := namespaceTestNative(t.Name(), "mcp__node_repl.js", args)
 					upstream := map[string]any{"id": "resp_native_roundtrip", "status": "completed", "output": []any{native}}
 					upstreamSSE := []byte("event: response.completed\ndata: " + string(jsonBytes(map[string]any{"type": "response.completed", "response": upstream})) + "\n\n")
-					service := NewService()
+					service := newHTTPTestService()
 					closed := make(chan map[string]any, 1)
 					var emitted []byte
 					service.SetHost(func(method string, payload any, out any) error {

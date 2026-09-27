@@ -17,6 +17,12 @@ type Service struct {
 	cfg         Config
 	host        HostCall
 	stopped     bool
+	streams     map[*runningStream]struct{}
+	streamWG    sync.WaitGroup
+	requests    map[string]*requestScope
+	authEditMu  sync.Mutex
+	authDir     string
+	authPage    string
 }
 
 func NewService() *Service {
@@ -87,6 +93,7 @@ func (s *Service) Handle(method string, raw json.RawMessage) (any, error) {
 		}
 		return registration(s.config()), nil
 	case "plugin.quiesce":
+		s.stopStreams()
 		return map[string]any{}, nil
 	case "auth.identifier":
 		// CPA 按这个标识把文件认证交给插件解析；Basis Points 使用
@@ -95,7 +102,27 @@ func (s *Service) Handle(method string, raw json.RawMessage) (any, error) {
 	case "executor.identifier":
 		return map[string]any{"identifier": Provider}, nil
 	case "auth.parse":
-		return authParse(raw)
+		var request authParseRequest
+		if err := json.Unmarshal(raw, &request); err != nil {
+			return nil, err
+		}
+		result, err := parseAuthRequest(request)
+		if err == nil && request.Host.AuthDir != "" {
+			s.mu.Lock()
+			s.authDir = filepath.Clean(request.Host.AuthDir)
+			s.mu.Unlock()
+		}
+		return result, err
+	case "management.register":
+		return s.registerSourceAuthManagement(raw)
+	case "management.handle":
+		return s.handleSourceAuthManagement(raw)
+	case "request.intercept_before":
+		return map[string]any{}, nil
+	case "request.intercept_after":
+		return s.interceptUpstreamRequest(raw)
+	case "request.complete":
+		return s.completeUpstreamRequest(raw)
 	case "auth.login.start":
 		return nil, fail(400, "login_unavailable", "Import an existing CPA codex OAuth credential; interactive login is not used")
 	case "auth.login.poll":
@@ -115,9 +142,7 @@ func (s *Service) Handle(method string, raw json.RawMessage) (any, error) {
 	case "executor.http_request":
 		return nil, fail(400, "unsupported_method", "use the Basis Points model executor")
 	case "plugin.shutdown":
-		s.mu.Lock()
-		s.stopped = true
-		s.mu.Unlock()
+		s.stopStreams()
 		return map[string]any{}, nil
 	default:
 		return nil, fail(400, "unsupported_method", "unsupported plugin method: "+method)
@@ -142,7 +167,7 @@ func (s *Service) execute(raw json.RawMessage, stream bool) (any, error) {
 	if stream {
 		return s.executeStream(request, body, credential)
 	}
-	payload, response, headers, err := s.executeResponse(request, body, credential, false)
+	payload, response, headers, err := s.executeResponse(request, body, credential)
 	if err != nil {
 		return nil, err
 	}
@@ -153,37 +178,39 @@ func (s *Service) execute(raw json.RawMessage, stream bool) (any, error) {
 }
 
 // 在交付任何客户端数据前完成全量校验，畸形调用只允许重生成一次。
-func (s *Service) executeResponse(request ExecutorRequest, body map[string]any, credential credential, stream bool) ([]byte, map[string]any, http.Header, error) {
+func (s *Service) executeResponse(request ExecutorRequest, body map[string]any, credential credential) ([]byte, map[string]any, http.Header, error) {
+	run, err := s.startRun(request)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer run.finish()
 	source, err := executorSource(request)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	for attempt := 0; attempt < 2; attempt++ {
-		var raw []byte
+		response, selected, wsErr := s.tryWebSocket(request, body, credential, run, nil)
+		if wsErr != nil {
+			return nil, nil, nil, wsErr
+		}
 		var headers http.Header
-		if stream {
-			upstream, openErr := s.upstreamStream(request, body, credential)
-			if openErr != nil {
-				return nil, nil, nil, openErr
+		if !selected {
+			if err := run.contextError(); err != nil {
+				return nil, nil, nil, err
 			}
-			headers = upstream.Headers
-			raw, err = s.readUpstreamStream(upstream)
-		} else {
 			upstream, openErr := s.upstreamRequest(request, body, credential, false)
 			if openErr != nil {
 				return nil, nil, nil, openErr
 			}
-			headers, raw = upstream.Headers, upstream.Body
-		}
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		if len(raw) > s.config().MaxResponseBytes {
-			return nil, nil, nil, fail(502, "upstream_response_too_large", "Basis Points response exceeds configured limit")
-		}
-		response, parseErr := parseResponse(raw, headers)
-		if parseErr != nil {
-			return nil, nil, nil, parseErr
+			headers = upstream.Headers
+			if len(upstream.Body) > s.config().MaxResponseBytes {
+				return nil, nil, nil, fail(502, "upstream_response_too_large", "Basis Points response exceeds configured limit")
+			}
+			var parseErr error
+			response, parseErr = parseResponse(upstream.Body, headers)
+			if parseErr != nil {
+				return nil, nil, nil, parseErr
+			}
 		}
 		payload, transformed, _, transformErr := transformResponseBody(jsonBytes(response), source)
 		if transformErr == nil {
@@ -210,42 +237,22 @@ func (s *Service) executeResponse(request ExecutorRequest, body map[string]any, 
 	return nil, nil, nil, relayError("retry_exhausted")
 }
 
-func (s *Service) executeStream(request ExecutorRequest, body map[string]any, credential credential) (any, error) {
-	if request.StreamID == "" {
-		return nil, fail(500, "stream_id_missing", "executor.execute_stream requires stream_id")
-	}
-	// 宿主 stream.close 只接受错误字符串；先验证再返回，保留 RPC HTTP 状态。
-	_, response, _, err := s.executeResponse(request, body, credential, true)
-	if err != nil {
-		return nil, err
-	}
-	go func() {
-		payload := map[string]any{"stream_id": request.StreamID}
-		for _, frame := range executorStreamPayloads(request.Format, response) {
-			if emitErr := s.call("host.stream.emit", map[string]any{"stream_id": request.StreamID, "payload": frame}, nil); emitErr != nil {
-				payload["error"] = "client disconnected while receiving stream"
-				break
-			}
-		}
-		_ = s.call("host.stream.close", payload, nil)
-	}()
-	return map[string]any{"Headers": map[string][]string{"Content-Type": {"text/event-stream"}, "Cache-Control": {"no-cache"}}}, nil
-}
-
 func (s *Service) status() map[string]any {
 	cfg := s.config()
 	s.mu.RLock()
 	stopped := s.stopped
 	s.mu.RUnlock()
 	return map[string]any{
-		"provider":          Provider,
-		"version":           Version,
-		"responses_url":     cfg.ResponsesURL,
-		"upstream_model":    cfg.UpstreamModel,
-		"models":            cfg.Models,
-		"model_mappings":    cfg.ModelMappings,
-		"stopped":           stopped,
-		"reasoning_efforts": []string{"low", "medium", "high", "xhigh", "ultra"},
+		"provider":                     Provider,
+		"version":                      Version,
+		"responses_url":                cfg.ResponsesURL,
+		"upstream_model":               cfg.UpstreamModel,
+		"models":                       cfg.Models,
+		"model_mappings":               cfg.ModelMappings,
+		"upstream_transport":           cfg.UpstreamTransport,
+		"ws_handshake_timeout_seconds": cfg.WSHandshakeTimeoutSeconds,
+		"stopped":                      stopped,
+		"reasoning_efforts":            []string{"low", "medium", "high", "xhigh", "ultra"},
 	}
 }
 
@@ -259,6 +266,8 @@ func registration(cfg Config) map[string]any {
 			"GitHubRepository": "https://github.com/JaxsonWang/cpa-plugin-oai-basispoints",
 			"Description":      "CPA Responses adapter for bps.openai.com with safe client-tool relay",
 			"ConfigFields": []map[string]any{
+				{"Name": "upstream_transport", "Type": "string", "Description": "auto：仅凭据 websockets 已开启时优先 WS，握手失败可回退 HTTP/SSE；http：仅使用 HTTP/SSE。"},
+				{"Name": "ws_handshake_timeout_seconds", "Type": "integer", "Description": "WS 单次握手上限，默认 5 秒；每轮生成只尝试一次。"},
 				{"Name": "responses_url", "Type": "string", "Description": "Basis Points Responses endpoint."},
 				{"Name": "upstream_model", "Type": "string", "Description": "未单独配置 model_mappings 的别名使用的上游模型。"},
 				{"Name": "models", "Type": "array", "Description": "启用的客户端模型别名列表，数量不限。"},
@@ -270,14 +279,16 @@ func registration(cfg Config) map[string]any {
 			},
 		},
 		"capabilities": map[string]any{
-			"auth_provider":           true,
-			"model_provider":          true,
-			"executor":                true,
-			"executor_model_scope":    "both",
-			"executor_input_formats":  []string{"openai-response", "codex"},
-			"executor_output_formats": []string{"openai-response", "codex"},
-			"response_interceptor":    true,
-			"management_api":          false,
+			"auth_provider":            true,
+			"model_provider":           true,
+			"executor":                 true,
+			"executor_model_scope":     "both",
+			"executor_input_formats":   []string{"openai-response", "codex"},
+			"executor_output_formats":  []string{"openai-response", "codex"},
+			"response_interceptor":     true,
+			"request_interceptor":      true,
+			"request_lifecycle_plugin": true,
+			"management_api":           true,
 		},
 		"config": cfg,
 	}

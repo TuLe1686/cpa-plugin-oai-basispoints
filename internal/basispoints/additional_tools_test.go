@@ -72,12 +72,12 @@ func TestAdditionalToolsCatalogAndHistory(t *testing.T) {
 				}
 				result := map[string]any{"type": outputType, "call_id": historical["call_id"], "output": "PROBE_OK"}
 				history := []any{additionalToolsItem(tools), user, historical, result}
-				replay := translateInputItems(history, specs)
+				replay := translateInputItems(history)
 				if len(replay) != 3 || !reflect.DeepEqual(replay[0], user) {
 					t.Fatalf("history changed: %#v", replay)
 				}
 				envelope, err := transportEnvelope(objectValue(replay[1]))
-				if err != nil || envelope["tool"] != "functions.exec" || !reflect.DeepEqual(envelope["args"], args) {
+				if err != nil || envelope["tool"] != "functions.exec" || envelope["args"] != relayTestPayload(args) {
 					t.Fatalf("invalid replay: %#v err=%v", envelope, err)
 				}
 				if output := objectValue(replay[2]); output["type"] != "function_call_output" || output["output"] != "PROBE_OK" {

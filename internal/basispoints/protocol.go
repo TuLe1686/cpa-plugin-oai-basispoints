@@ -17,9 +17,9 @@ import (
 const (
 	transportName       = "run_officejs"
 	transportAlias      = "functions.run_officejs"
-	transportRetryHint  = "The previous run_officejs relay was malformed. Retry once with exactly one outer run_officejs call; code is JSON text containing one catalog-tool object, not JavaScript."
+	transportRetryHint  = "The previous run_officejs relay was malformed. Retry once using exactly one client tool name in outer references and only its payload in code: a JSON arguments object for function tools, or unchanged raw input for custom tools. Do not wrap the payload in a tool/args object. Serialize the outer arguments once, including quotes and backslashes."
 	toolCatalogPrefix   = "This request is relayed by an external Responses API client, not by the live Excel workbook. The native run_officejs function is a transport endpoint owned by this proxy. The proxy intercepts it before execution, so it never runs Office code or changes the workbook."
-	toolCatalogReminder = "Reminder: use the outer native run_officejs transport; put exactly one JSON object as JSON text in code. The inner name must be one catalog client tool and must never be run_officejs or functions.run_officejs."
+	toolCatalogReminder = "Reminder: use the outer native run_officejs transport. Set references to an array containing exactly one catalog client tool name; put only that tool payload in code. Never put a tool/args wrapper in code or route to run_officejs or functions.run_officejs."
 )
 
 type toolSpec struct {
@@ -167,9 +167,21 @@ func clientToolProtocolInstructions(source map[string]any) string {
 	if parallel, ok := source["parallel_tool_calls"].(bool); ok && !parallel {
 		catalogText += "\nInvoke at most one client tool in this response."
 	}
-	return toolCatalogPrefix + " Other native server-injected Excel, Office, connector, workbook, list_skills, and web-search tools are unavailable. Never claim shell, filesystem, or workspace access is unavailable when the catalog contains a suitable tool. For repository inspection, invoke a suitable catalog shell tool through run_officejs. Transport has two layers and they must not be mixed: the outer native tool is run_officejs (some hosts display it as functions.run_officejs); the inner code value is JSON text containing exactly one compact JSON object for one catalog client tool. For a function tool, use this shape: outer arguments include summary, extended_summary, destructive=false, references=[], and code equal to {\"tool\":\"exec_command\",\"args\":{\"cmd\":\"pwd\"}}. For a custom tool, code instead contains {\"tool\":\"TOOL_NAME\",\"args\":\"RAW_INPUT\"}. Do not put JavaScript, OfficeJS, a second run_officejs envelope, or a functions.run_officejs wrapper inside code. The field is named code for compatibility; it is not JavaScript. Serialize the complete inner object before placing it there, including backslashes and quotes. The proxy converts this native call into the real client tool call, then replays the original run_officejs identity with the client tool result on the next request. Interpret that result as the named client tool output. Never repeat a tool request whose output is already present. Available client tools:\n" + catalogText + "\n" + toolCatalogReminder +
-		" Remember: use a separate outer native run_officejs call for each client tool invocation; put exactly one catalog-tool JSON object in its code field." +
-		" The available catalog is authoritative for tool names and arguments."
+	functionExample := string(jsonBytes(map[string]any{
+		"summary": "Run client tool exec_command", "extended_summary": "Relay a shell command through the external client",
+		"destructive": false, "references": []any{"exec_command"},
+		"code": string(jsonBytes(map[string]any{"cmd": `printf "hello"`})),
+	}))
+	customExample := string(jsonBytes(map[string]any{
+		"summary": "Run client tool apply_patch", "extended_summary": "Relay an unchanged patch through the external client",
+		"destructive": false, "references": []any{"apply_patch"},
+		"code": `*** Begin Patch
+*** Add File: hello.js
++console.log("hello");
+*** End Patch`,
+	}))
+	return toolCatalogPrefix + " Other native server-injected Excel, Office, connector, workbook, list_skills, and web-search tools are unavailable. Never claim shell, filesystem, or workspace access is unavailable when the catalog contains a suitable tool. For repository inspection, invoke a suitable catalog shell tool through run_officejs. Set outer references to an array containing exactly one fully qualified client tool name from the catalog; references is the routing field, not a list of files or cells. Set outer code to only that tool's payload. For a function tool, code contains one JSON object of arguments. For a custom tool, code contains the exact raw input text, not JSON: preserve every quote, backslash, newline and space without another encoding layer. The proxy parses function arguments but does not parse custom input. Serialize the outer arguments object once. Do not put JavaScript wrappers, Markdown fences, a tool/args envelope, or another run_officejs call around the payload. Historical calls may contain the old tool/args envelope; do not copy that format into new calls. Example outer arguments for a function tool: " + functionExample + ". Example outer arguments for a custom tool: " + customExample + ". The proxy converts this native call into the real client tool call, then replays the original run_officejs identity with the client tool result on the next request. Interpret that result as the named client tool output. Never repeat a tool request whose output is already present. Available client tools:" + "\n" + catalogText + "\n" + toolCatalogReminder +
+		" Use a separate outer native run_officejs call for each client tool invocation. The available catalog is authoritative for tool names and arguments."
 }
 
 func describeParameterNames(parameters map[string]any) string {
@@ -218,10 +230,10 @@ func clientToolProtocolReminder(source map[string]any) string {
 			}
 		}
 	}
-	reminder := toolCatalogReminder + " Example inner code: {\"tool\":\"exec_command\",\"args\":{\"cmd\":\"pwd\"}}. Do not merely say you will act; make the tool call. Client tools: " + strings.Join(names, ", ") + ". Other native tools are unavailable."
+	reminder := toolCatalogReminder + " Do not merely say you will act; make the tool call. Client tools: " + strings.Join(names, ", ") + ". Other native tools are unavailable."
 	for name, spec := range specs {
 		if spec.Type == "custom" {
-			reminder += " Custom tool " + name + " uses input, not arguments."
+			reminder += " Custom tool " + name + " takes raw input directly in code; do not JSON-encode that input."
 		}
 	}
 	return reminder
@@ -309,18 +321,16 @@ func fallbackTransportCall(item map[string]any) map[string]any {
 	if callID == "" {
 		callID = "call_bp_" + shortHash(fmt.Sprintf("%v", time.Now().UnixNano()))
 	}
-	inner := map[string]any{"tool": name}
+	payload, _ := item["arguments"].(string)
 	if stringValue(item["type"]) == "custom_tool_call" {
-		inner["args"], _ = item["input"].(string)
-	} else {
-		inner["args"] = parseArguments(item["arguments"])
+		payload, _ = item["input"].(string)
 	}
 	outerArguments := map[string]any{
 		"summary":          "Run client tool " + name,
 		"extended_summary": "Relay " + name + " through the external client",
-		"code":             string(jsonBytes(inner)),
+		"code":             payload,
 		"destructive":      false,
-		"references":       []any{},
+		"references":       []any{name},
 	}
 	return map[string]any{
 		"type":      "function_call",
@@ -332,7 +342,7 @@ func fallbackTransportCall(item map[string]any) map[string]any {
 	}
 }
 
-func translateInputItems(rawInput any, allowed map[string]toolSpec) []any {
+func translateInputItems(rawInput any) []any {
 	if text, ok := rawInput.(string); ok {
 		return []any{messageItem("user", text)}
 	}
@@ -367,14 +377,11 @@ func translateInputItems(rawInput any, allowed map[string]toolSpec) []any {
 				result = append(result, item)
 				continue
 			}
-			if _, exists := allowed[name]; exists {
-				if callID != "" {
-					origins[callID] = transportName
-				}
-				result = append(result, fallbackTransportCall(item))
-				continue
+			// 压缩请求可能没有工具目录；历史调用自身已包含名称和载荷。
+			if callID != "" {
+				origins[callID] = transportName
 			}
-			result = append(result, item)
+			result = append(result, fallbackTransportCall(item))
 			continue
 		}
 		if itemType == "function_call_output" || itemType == "custom_tool_call_output" {
@@ -528,6 +535,12 @@ func prepareResponsesBody(source map[string]any, cfg Config) (map[string]any, er
 	if tier := source["service_tier"]; tier != nil && tier != "auto" && tier != "default" {
 		return nil, fail(400, "unsupported_service_tier", "oai-basispoints supports only the standard service tier; omit service_tier or use auto/default; Fast/priority is not supported")
 	}
+	if err := validateTextFormat(source["text"]); err != nil {
+		return nil, err
+	}
+	if err := validateAgentMessageEncryption(source["input"]); err != nil {
+		return nil, err
+	}
 	model := stringValue(source["model"])
 	upstream, ok := cfg.resolveUpstreamModel(model)
 	if !ok {
@@ -536,7 +549,7 @@ func prepareResponsesBody(source map[string]any, cfg Config) (map[string]any, er
 	if clientToolCallRequired(source) && len(callableClientToolSpecs(source)) == 0 {
 		return nil, fail(400, "invalid_tool_choice", "tool_choice does not select any available client tool")
 	}
-	inputItems := translateInputItems(source["input"], clientToolSpecs(source))
+	inputItems := translateInputItems(source["input"])
 	historyRoot := conversationFingerprint(inputItems)
 	prologue := []any{}
 	if instructions := stringValue(source["instructions"]); instructions != "" {
@@ -593,6 +606,55 @@ func prepareResponsesBody(source map[string]any, cfg Config) (map[string]any, er
 	}
 	output["metadata"] = metadata
 	return output, nil
+}
+
+// 代理密文不等于普通正文；不猜测解密、不丢失内容，也不影响原有 reasoning 密文。
+func validateAgentMessageEncryption(input any) error {
+	items, _ := input.([]any)
+	for _, value := range items {
+		item := objectValue(value)
+		if strings.ToLower(strings.TrimSpace(stringValue(item["type"]))) != "agent_message" {
+			continue
+		}
+		content, _ := item["content"].([]any)
+		for _, value := range content {
+			if stringValue(objectValue(value)["type"]) == "encrypted_content" {
+				return fail(400, "unsupported_encrypted_agent_message", "oai-basispoints does not implement encrypted agent_message content required by Codex multi-agent v2; refresh the model catalog and start a new session without a v2 override")
+			}
+		}
+	}
+	return nil
+}
+
+// 尚未接入结构化输出契约，不能丢弃格式后把普通正文当成成功结果。
+// verbosity 的上游契约仍待验证，本次不改变既有客户端的默认请求处理。
+func validateTextFormat(value any) error {
+	if value == nil {
+		return nil
+	}
+	text, ok := value.(map[string]any)
+	if !ok {
+		return fail(400, "invalid_text_config", "text must be an object")
+	}
+	value = text["format"]
+	if value == nil {
+		return nil
+	}
+	format, ok := value.(map[string]any)
+	if !ok {
+		return fail(400, "invalid_text_format", "text.format must be an object")
+	}
+	switch format["type"] {
+	case "text":
+		if len(format) != 1 {
+			return fail(400, "invalid_text_format", "plain text.format accepts only type")
+		}
+		return nil
+	case "json_object", "json_schema":
+		return fail(400, "unsupported_text_format", "oai-basispoints does not implement structured text.format output; omit the format or use type=text")
+	default:
+		return fail(400, "invalid_text_format", "text.format.type must be text, json_object, or json_schema")
+	}
 }
 
 func minInt(left, right int) int {
@@ -660,26 +722,20 @@ func transportEnvelope(native map[string]any) (map[string]any, error) {
 	if reason != "" {
 		return nil, relayError("outer_arguments " + reason)
 	}
-	for depth := 0; ; depth++ {
-		code, ok := arguments["code"].(string)
-		if !ok {
-			return nil, relayError("code_not_string")
-		}
-		envelope, reason := parseRelayObject(code)
-		if reason != "" {
-			return nil, relayError("code " + reason)
-		}
-		if !isTransportName(stringValue(envelope["name"])) {
-			return envelope, nil
-		}
-		if depth >= 2 {
-			return nil, relayError("nested_transport_depth")
-		}
-		arguments, reason = parseRelayObject(envelope["arguments"])
-		if reason != "" {
-			return nil, relayError("nested_arguments " + reason)
-		}
+	// 路由与载荷分离，避免补丁正文被再次包进 JSON 字符串。
+	references, ok := arguments["references"].([]any)
+	if !ok || len(references) != 1 {
+		return nil, relayError("references_must_select_one_tool")
 	}
+	name, ok := references[0].(string)
+	if !ok || name == "" || isTransportName(name) {
+		return nil, relayError("invalid_client_tool_reference")
+	}
+	code, ok := arguments["code"].(string)
+	if !ok {
+		return nil, relayError("code_not_string")
+	}
+	return map[string]any{"tool": name, "args": code}, nil
 }
 
 func schemaMatches(value any, schema map[string]any) bool {
@@ -772,19 +828,21 @@ func schemaMatches(value any, schema map[string]any) bool {
 }
 
 func extractNativeClientToolCall(native map[string]any, specs map[string]toolSpec) (map[string]any, error) {
+	return extractNativeClientToolCallIn(native, specs, specs)
+}
+
+// callable 限制本轮调用权限，declared 只用于区分目录缺失与本轮禁用。
+func extractNativeClientToolCallIn(native map[string]any, callable, declared map[string]toolSpec) (map[string]any, error) {
 	inner, err := transportEnvelope(native)
 	if err != nil {
 		return nil, err
 	}
-	name := stringValue(inner["tool"])
-	if name == "" {
-		name = stringValue(inner["name"])
-	}
-	if name == "" || isTransportName(name) {
-		return nil, relayError("invalid_inner_tool")
-	}
-	spec, exists := specs[name]
+	name, _ := inner["tool"].(string)
+	spec, exists := callable[name]
 	if !exists {
+		if _, declaredOnly := declared[name]; declaredOnly {
+			return nil, relayError("tool_not_allowed_by_tool_choice")
+		}
 		return nil, relayError("tool_not_in_catalog")
 	}
 	callID := stringValue(native["call_id"])
@@ -804,23 +862,13 @@ func extractNativeClientToolCall(native map[string]any, specs map[string]toolSpe
 		result["namespace"] = spec.Namespace
 	}
 	if spec.Type == "custom" {
-		input := inner["input"]
-		if input == nil {
-			input = inner["args"]
-		}
-		if _, ok := input.(string); !ok {
-			return nil, relayError("custom_args_not_string")
-		}
 		result["type"] = "custom_tool_call"
-		result["input"] = input
+		result["id"] = "ctc_" + strings.TrimPrefix(stringValue(result["id"]), "fc_")
+		result["input"] = inner["args"]
 	} else {
-		arguments := inner["args"]
-		if arguments == nil {
-			arguments = inner["arguments"]
-		}
-		parsed, reason := parseRelayObject(arguments)
+		parsed, reason := parseRelayObject(inner["args"])
 		if reason != "" {
-			return nil, relayError("arguments " + reason)
+			return nil, relayError("code " + reason)
 		}
 		if !schemaMatches(parsed, firstMap(spec.Spec, "parameters", "inputSchema", "input_schema")) {
 			return nil, relayError("arguments_schema_mismatch")
@@ -844,6 +892,7 @@ func transformResponseBody(body []byte, source map[string]any) ([]byte, map[stri
 	}
 	output, _ := response["output"].([]any)
 	specs := callableClientToolSpecs(source)
+	declared := clientToolSpecs(source)
 	replaced := make([]any, 0, len(output))
 	natives := make([]map[string]any, 0)
 	callIDs := map[string]bool{}
@@ -853,7 +902,7 @@ func transformResponseBody(body []byte, source map[string]any) ([]byte, map[stri
 			replaced = append(replaced, value)
 			continue
 		}
-		call, err := extractNativeClientToolCall(item, specs)
+		call, err := extractNativeClientToolCallIn(item, specs, declared)
 		if err != nil {
 			// 不把服务器注入工具或损坏的中转载荷交给客户端执行。
 			return nil, nil, false, err
@@ -913,6 +962,10 @@ func syntheticStream(response map[string]any) []byte {
 				field, event = "input", "response.custom_tool_call_input"
 			}
 			added := cloneObject(item)
+			if stringValue(item["type"]) == "message" {
+				added["status"] = "in_progress"
+				added["content"] = []any{}
+			}
 			if field != "" {
 				added[field] = ""
 				if field == "arguments" {
@@ -927,7 +980,7 @@ func syntheticStream(response map[string]any) []byte {
 				}
 				emit(event+".done", map[string]any{"output_index": index, "item_id": item["id"], field: text})
 			} else if stringValue(item["type"]) == "message" {
-				emitMessageTextDeltas(emit, index, item)
+				emitMessageContent(emit, index, item)
 			}
 			emit("response.output_item.done", map[string]any{"output_index": index, "item": item})
 		}
@@ -941,25 +994,35 @@ func syntheticStream(response map[string]any) []byte {
 	return []byte(builder.String())
 }
 
-func emitMessageTextDeltas(emit func(string, map[string]any), outputIndex int, item map[string]any) {
+// 按原始 content 下标回放，不能因空正文或拒绝片段而压缩索引。
+func emitMessageContent(emit func(string, map[string]any), outputIndex int, item map[string]any) {
 	content, _ := item["content"].([]any)
-	contentIndex := 0
-	for _, value := range content {
+	for contentIndex, value := range content {
 		part := objectValue(value)
-		if part == nil || stringValue(part["type"]) != "output_text" {
+		if part == nil {
 			continue
 		}
-		text, _ := part["text"].(string)
-		if text == "" {
-			continue
+		added := cloneObject(part)
+		text, isText := part["text"].(string)
+		isText = isText && stringValue(part["type"]) == "output_text"
+		if isText {
+			added["text"] = ""
+			if _, exists := added["logprobs"]; exists {
+				added["logprobs"] = []any{}
+			}
 		}
-		emit("response.output_text.delta", map[string]any{
-			"output_index":  outputIndex,
-			"content_index": contentIndex,
-			"item_id":       item["id"],
-			"delta":         text,
-		})
-		contentIndex++
+		emit("response.content_part.added", map[string]any{"output_index": outputIndex, "content_index": contentIndex, "item_id": item["id"], "part": added})
+		if isText {
+			logprobs, _ := part["logprobs"].([]any)
+			if logprobs == nil {
+				logprobs = []any{}
+			}
+			if text != "" {
+				emit("response.output_text.delta", map[string]any{"output_index": outputIndex, "content_index": contentIndex, "item_id": item["id"], "delta": text, "logprobs": logprobs})
+			}
+			emit("response.output_text.done", map[string]any{"output_index": outputIndex, "content_index": contentIndex, "item_id": item["id"], "text": text, "logprobs": logprobs})
+		}
+		emit("response.content_part.done", map[string]any{"output_index": outputIndex, "content_index": contentIndex, "item_id": item["id"], "part": part})
 	}
 }
 
