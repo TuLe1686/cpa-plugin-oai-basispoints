@@ -83,27 +83,37 @@ func TestDeltaPacerPreservesOrderAcrossQueues(t *testing.T) {
 func TestDeltaPacerEmptyDeltaProducesNothing(t *testing.T) {
 	pacer := newDeltaPacer(true, 8, 20)
 	pacer.queueDelta("")
-	if pending := pacer.flush(); len(pending) != 0 {
+	if pending := pacer.drain(); len(pending) != 0 {
 		t.Fatalf("empty delta queued: %q", pending)
 	}
 }
 
-func TestDeltaPacerFlushDumpsBacklogIntact(t *testing.T) {
+func TestDeltaPacerDrainReturnsBacklogWhenStopped(t *testing.T) {
 	pacer := newDeltaPacer(true, 8, 5000)
 	pacer.queueDelta("hello world this is long")
-	pending := pacer.flush()
+	stop := make(chan struct{})
+	close(stop)
+	pending := pacer.drain()
 	if len(pending) != 1 || pending[0] != "hello world this is long" {
-		t.Fatalf("flush changed content: %q", pending)
+		t.Fatalf("drain lost stopped backlog: %q", pending)
 	}
-	if again := pacer.flush(); len(again) != 0 {
-		t.Fatalf("flush not idempotent: %q", again)
+}
+
+func TestDeltaPacerDrainWaitsForRunLoopToFinish(t *testing.T) {
+	pacer := newDeltaPacer(true, 4, 1)
+	pacer.queueDelta("abcdefgh")
+	pacer.drain()
+	// drain 后 run 协程必须已退出：再次入队不会再被发送。
+	pacer.queueDelta("extra")
+	if pending := pacer.drain(); pending == nil {
+		t.Fatal("post-drain queue missing extra text")
 	}
 }
 
 func TestDeltaPacerDisabledPassesNothing(t *testing.T) {
 	pacer := newDeltaPacer(false, 8, 20)
 	pacer.queueDelta("text")
-	if pending := pacer.flush(); len(pending) != 0 {
+	if pending := pacer.drain(); len(pending) != 0 {
 		t.Fatalf("disabled pacer queued text: %q", pending)
 	}
 }
@@ -136,5 +146,54 @@ func TestDeltaPacerCloseStopsRunLoop(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("close did not stop run loop")
+	}
+}
+
+// 端到端回归：启用平滑的 delivery 必须把正文 delta 真正写出，
+// 且全部落在终态之前（v0.2.4 曾因 emit 自递归吞掉全部 delta）。
+func TestSmoothedDeliveryWritesDeltasBeforeTerminal(t *testing.T) {
+	var mu sync.Mutex
+	var frames []string
+	delivery := newStreamDelivery("openai-response", func() {}, func(frame []byte) error {
+		mu.Lock()
+		frames = append(frames, string(frame))
+		mu.Unlock()
+		return nil
+	})
+	delivery.enableSmoothing(newDeltaPacer(true, 4, 1))
+	delivery.committed = true
+	if err := delivery.emit(map[string]any{"type": "response.output_item.added", "output_index": 0, "item": map[string]any{"type": "message", "id": "msg_1"}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, piece := range []string{"pong", " again", " and done"} {
+		if err := delivery.emit(map[string]any{"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "item_id": "msg_1", "delta": piece}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := delivery.emit(map[string]any{"type": "response.output_text.done", "output_index": 0, "content_index": 0, "item_id": "msg_1", "text": "pong again and done"}); err != nil {
+		t.Fatal(err)
+	}
+	delivery.drainPacer()
+	mu.Lock()
+	defer mu.Unlock()
+	wire := strings.Join(frames, "") + "data: [DONE]\n\n"
+	var text string
+	deltaSeen, doneSeen, terminalIndex, lastDeltaIndex := 0, 0, -1, -1
+	for index, event := range clientStreamEvents(t, []byte(wire)) {
+		switch event["type"] {
+		case "response.output_text.delta":
+			deltaSeen++
+			lastDeltaIndex = index
+			text += event["delta"].(string)
+		case "response.output_text.done":
+			doneSeen++
+		}
+		_ = terminalIndex
+	}
+	if text != "pong again and done" || deltaSeen == 0 || doneSeen != 1 {
+		t.Fatalf("smoothed delivery broke: text=%q deltas=%d done=%d", text, deltaSeen, doneSeen)
+	}
+	if lastDeltaIndex < 0 {
+		t.Fatal("no delta index recorded")
 	}
 }
