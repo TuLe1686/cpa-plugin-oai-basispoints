@@ -370,7 +370,6 @@ func (d *streamDelivery) emitBytes(payload []byte) error {
 }
 
 func (d *streamDelivery) finish(response map[string]any) error {
-	d.drainPacer()
 	if !d.committed {
 		d.committed = true
 		d.start()
@@ -379,10 +378,11 @@ func (d *streamDelivery) finish(response map[string]any) error {
 				return err
 			}
 		}
+		d.drainPacer()
 		return nil
 	}
 	decoder := newSSEDecoder()
-	return decoder.feed(syntheticStream(response), func(kind, data string) error {
+	err := decoder.feed(syntheticStream(response), func(kind, data string) error {
 		if data == "[DONE]" {
 			if d.format != "codex" {
 				return d.emitBytes([]byte("data: [DONE]\n\n"))
@@ -429,6 +429,12 @@ func (d *streamDelivery) finish(response map[string]any) error {
 		}
 		return d.emit(value)
 	})
+	if err != nil {
+		return err
+	}
+	// 回放的增量同样经过平滑；回放结束后统一排空，保证终态最后写出。
+	d.drainPacer()
+	return nil
 }
 
 func (d *streamDelivery) fail(err error) error {
