@@ -1,5 +1,11 @@
 # 更新日志
 
+## v0.2.3 — 2026-09-27（UTC+8）
+
+- 同步上游 v0.2.2：正文改为真实上游增量转发（v0.1.18 起），并新增凭据 `websockets` 字段控制的上游 WebSocket 优先传输与安全 SSE 回退（v0.2.0/v0.2.2）。
+- 本 fork 此前的 `response.output_text.delta` 修复已由上游 v0.1.14 正式合入；保留对应回归测试，并按上游语义修正 `content_index` 断言（保留原始下标，空片段占位不压缩）。
+- 未修改 CPA 主程序；`upstream_transport: auto` 默认行为与上游一致，凭据未开启 `websockets` 时仍走 HTTP/SSE。
+
 ## v0.2.2 — 2026-09-27（UTC+8）
 
 - 新增插件菜单「Basis Points 源认证」：通过 CPA 现有管理鉴权读取源文件状态并保存 `websockets`，解决虚拟认证不能直接编辑时缺少源文件操作入口的问题；不修改 CPA 主程序，原认证页面的编辑限制保持不变。
