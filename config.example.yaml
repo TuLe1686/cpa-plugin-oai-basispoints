@@ -47,6 +47,16 @@ plugins:
       # 读取上游响应的超时时间，单位：秒；范围：10～1800，默认 300。
       timeout_seconds: 300
 
+      # 流式保活，单位：秒；范围：0～300，默认 45，0 关闭。
+      # 上游已返回 response.created 但持续静默时提前开流并重复发送 response.in_progress，
+      # 避免客户端空闲超时；代价是该请求放弃未开流时的一次工具重生成。
+      stream_keepalive_seconds: 45
+
+      # 正文平滑（fork 扩展）：把上游大块正文拆成小增量按节奏放行，默认开启。
+      smooth_stream: true
+      smooth_chunk_chars: 8
+      smooth_interval_ms: 20
+
       # 上游响应体大小上限，单位：字节；默认 67108864（64 MiB）。
       # 允许范围：65536（64 KiB）～134217728（128 MiB）。
       max_response_bytes: 67108864

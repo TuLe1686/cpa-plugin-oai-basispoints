@@ -6,6 +6,8 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 type streamedPart struct {
@@ -49,6 +51,21 @@ type streamDelivery struct {
 	pacerStop     chan struct{}
 	pacerOnce     sync.Once
 	writeMu       sync.Mutex
+	// stateMu 串行化读取协程与保活协程对交付状态的访问；重试只能 reset，不能整体替换结构体。
+	stateMu   sync.Mutex
+	lastWrite atomic.Int64
+}
+
+// reset 为一次未提交的重生成清空协议状态，保留平滑器、写出函数与锁。
+func (d *streamDelivery) reset() {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
+	d.committed, d.disconnected, d.terminal, d.sentinel = false, false, false, false
+	d.sequence, d.meta, d.pending = 0, nil, nil
+	d.knownMessages = map[int]string{}
+	d.knownParts = map[[2]int]bool{}
+	d.messages = map[int]*streamedMessage{}
+	d.reasonings = map[int]*streamedReasoning{}
 }
 
 func newStreamDelivery(format string, start func(), write func([]byte) error) *streamDelivery {
@@ -85,6 +102,12 @@ func streamIndex(value any) (int, error) {
 }
 
 func (d *streamDelivery) consume(event, data string) error {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
+	return d.consumeLocked(event, data)
+}
+
+func (d *streamDelivery) consumeLocked(event, data string) error {
 	if strings.TrimSpace(data) == "[DONE]" {
 		d.sentinel = true
 		return nil
@@ -180,6 +203,10 @@ func (d *streamDelivery) consume(event, data string) error {
 		frames = append(frames, frame)
 	}
 	d.pending = nil
+	return d.commitWith(frames)
+}
+
+func (d *streamDelivery) commitWith(frames []map[string]any) error {
 	d.committed = true
 	d.start()
 	created := cloneObject(d.meta)
@@ -195,6 +222,74 @@ func (d *streamDelivery) consume(event, data string) error {
 		}
 	}
 	return nil
+}
+
+// heartbeat 在上游静默时发送 response.in_progress。只在上游已返回 response.created
+// 后才会提交流：此时 HTTP 状态已确定，只放弃未提交时的一次工具重生成。
+func (d *streamDelivery) heartbeat() error {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
+	if d.meta == nil || d.terminal || d.sentinel || d.disconnected {
+		return nil
+	}
+	if !d.committed {
+		frames := make([]map[string]any, 0, len(d.pending))
+		for _, item := range d.pending {
+			frame, err := d.applyEvent(item)
+			if err != nil {
+				return err
+			}
+			frames = append(frames, frame)
+		}
+		d.pending = nil
+		return d.commitWith(frames)
+	}
+	progress := cloneObject(d.meta)
+	progress["status"], progress["output"] = "in_progress", []any{}
+	return d.emit(map[string]any{"type": "response.in_progress", "response": progress})
+}
+
+// startKeepAlive 启动静默保活；返回的函数停止协程并等待其退出，须在 finish/fail 之前调用。
+func (d *streamDelivery) startKeepAlive(interval time.Duration) func() {
+	if interval <= 0 {
+		return func() {}
+	}
+	d.lastWrite.Store(time.Now().UnixNano())
+	stop, done := make(chan struct{}), make(chan struct{})
+	tick := interval / 4
+	if tick < 10*time.Millisecond {
+		tick = 10 * time.Millisecond
+	}
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(tick)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				if time.Since(time.Unix(0, d.lastWrite.Load())) < interval {
+					continue
+				}
+				// 写出失败会标记 disconnected，读取侧随后按断连收尾。
+				_ = d.heartbeat()
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(stop)
+			<-done
+		})
+	}
+}
+
+func (d *streamDelivery) isCommitted() bool {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
+	return d.committed
 }
 
 func (d *streamDelivery) applyEvent(value map[string]any) (map[string]any, error) {
@@ -392,6 +487,8 @@ func (d *streamDelivery) applyMessageEvent(value map[string]any) (map[string]any
 
 // 终态必须与已交付文本相符；先核验这一点，再允许工具整批校验写入历史身份缓存。
 func (d *streamDelivery) validateFinal(response map[string]any) error {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
 	if !d.committed {
 		return nil
 	}
@@ -494,6 +591,7 @@ func (d *streamDelivery) emitDirect(value map[string]any) error {
 }
 
 func (d *streamDelivery) emitBytes(payload []byte) error {
+	d.lastWrite.Store(time.Now().UnixNano())
 	if err := d.write(payload); err != nil {
 		d.disconnected = true
 		return fail(499, "client_disconnected", "client disconnected while receiving stream")

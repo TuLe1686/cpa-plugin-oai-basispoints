@@ -114,7 +114,9 @@ func (s *Service) executeStream(request ExecutorRequest, body map[string]any, c 
 	}
 	go func() {
 		defer run.finish()
+		stopKeepAlive := delivery.startKeepAlive(time.Duration(s.config().StreamKeepAliveSeconds) * time.Second)
 		response, err := s.readStreamingResponse(request, body, c, run, delivery)
+		stopKeepAlive()
 		if err == nil {
 			err = delivery.finish(response)
 		}
@@ -153,7 +155,7 @@ func (s *Service) readStreamingResponse(request ExecutorRequest, body map[string
 			return transformed, nil
 		}
 		var apiError *APIError
-		if delivery.committed || attempt != 0 || response["status"] == "incomplete" || !errors.As(err, &apiError) || apiError.Kind != "invalid_tool_call" {
+		if delivery.isCommitted() || attempt != 0 || response["status"] == "incomplete" || !errors.As(err, &apiError) || apiError.Kind != "invalid_tool_call" {
 			return nil, err
 		}
 		// 没有提交任何客户端数据的工具请求仍保留原有一次重生成；已经输出则绝不重跑。
@@ -161,7 +163,7 @@ func (s *Service) readStreamingResponse(request ExecutorRequest, body map[string
 		items, _ := body["input"].([]any)
 		retry["input"] = appendBeforeCompaction(append([]any{}, items...), []any{messageItem("developer", transportRetryHint+" Diagnostic: "+apiError.Message)})
 		body = retry
-		*delivery = *newStreamDelivery(delivery.format, delivery.start, delivery.write)
+		delivery.reset()
 	}
 	return nil, relayError("retry_exhausted")
 }

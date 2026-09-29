@@ -129,6 +129,7 @@ type Config struct {
 	SmoothStream              bool              `yaml:"smooth_stream" json:"smooth_stream"`
 	SmoothChunkChars          int               `yaml:"smooth_chunk_chars" json:"smooth_chunk_chars"`
 	SmoothIntervalMs          int               `yaml:"smooth_interval_ms" json:"smooth_interval_ms"`
+	StreamKeepAliveSeconds    int               `yaml:"stream_keepalive_seconds" json:"stream_keepalive_seconds"`
 }
 
 func defaultConfig() Config {
@@ -145,6 +146,7 @@ func defaultConfig() Config {
 		SmoothStream:              true,
 		SmoothChunkChars:          8,
 		SmoothIntervalMs:          20,
+		StreamKeepAliveSeconds:    45,
 	}
 }
 
@@ -183,6 +185,9 @@ func (c *Config) normalize() error {
 	}
 	if c.SmoothChunkChars < 0 || c.SmoothChunkChars > 256 {
 		return fail(400, "invalid_config", "smooth_chunk_chars must be between 0 and 256")
+	}
+	if c.StreamKeepAliveSeconds < 0 || c.StreamKeepAliveSeconds > 300 {
+		return fail(400, "invalid_config", "stream_keepalive_seconds must be between 0 and 300")
 	}
 	if c.SmoothIntervalMs < 0 || c.SmoothIntervalMs > 1000 {
 		return fail(400, "invalid_config", "smooth_interval_ms must be between 0 and 1000")
