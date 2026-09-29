@@ -16,19 +16,24 @@ func (s *Service) config() Config {
 }
 
 func (s *Service) prepareRequest(request ExecutorRequest) (map[string]any, credential, error) {
+	body, c, _, err := s.prepareRequestTracked(request)
+	return body, c, err
+}
+
+func (s *Service) prepareRequestTracked(request ExecutorRequest) (map[string]any, credential, *imageHits, error) {
 	if request.Alt == "responses/compact" {
-		return nil, credential{}, fail(400, "unsupported_compaction", "oai-basispoints does not support /responses/compact; send full input history to /responses")
+		return nil, credential{}, nil, fail(400, "unsupported_compaction", "oai-basispoints does not support /responses/compact; send full input history to /responses")
 	}
 	c, err := credentialFromExecutor(request)
 	if err != nil {
-		return nil, credential{}, err
+		return nil, credential{}, nil, err
 	}
 	if !c.ExpiresAt.IsZero() && !time.Now().Before(c.ExpiresAt) {
-		return nil, credential{}, fail(401, "auth_expired", "ChatGPT OAuth access token has expired")
+		return nil, credential{}, nil, fail(401, "auth_expired", "ChatGPT OAuth access token has expired")
 	}
 	source, err := executorSource(request)
 	if err != nil {
-		return nil, credential{}, err
+		return nil, credential{}, nil, err
 	}
 	cfg := s.config()
 	model := stringValue(source["model"])
@@ -39,13 +44,14 @@ func (s *Service) prepareRequest(request ExecutorRequest) (map[string]any, crede
 	source["stream"] = request.Stream
 	prepared, err := prepareResponsesBody(source, cfg)
 	if err != nil {
-		return nil, credential{}, err
+		return nil, credential{}, nil, err
 	}
 	// 先按原始图片计算会话标识，再替换附件引用，避免上传 ID 改变 task/turn。
-	if err := s.uploadInputImages(request, prepared, c, cfg); err != nil {
-		return nil, credential{}, err
+	hits, err := s.uploadInputImagesTracked(request, prepared, c, cfg)
+	if err != nil {
+		return nil, credential{}, nil, err
 	}
-	return prepared, c, nil
+	return prepared, c, hits, nil
 }
 
 func authHeaders(c credential, stream bool) http.Header {

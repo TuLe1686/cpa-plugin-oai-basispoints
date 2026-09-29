@@ -97,7 +97,7 @@ func (s *Service) stopStreams() {
 	s.streamWG.Wait()
 }
 
-func (s *Service) executeStream(request ExecutorRequest, body map[string]any, c credential) (any, error) {
+func (s *Service) executeStream(request ExecutorRequest, body map[string]any, c credential, hits *imageHits) (any, error) {
 	if request.StreamID == "" {
 		return nil, fail(500, "stream_id_missing", "executor.execute_stream requires stream_id")
 	}
@@ -115,7 +115,7 @@ func (s *Service) executeStream(request ExecutorRequest, body map[string]any, c 
 	go func() {
 		defer run.finish()
 		stopKeepAlive := delivery.startKeepAlive(time.Duration(s.config().StreamKeepAliveSeconds) * time.Second)
-		response, err := s.readStreamingResponse(request, body, c, run, delivery)
+		response, err := s.readStreamingResponse(request, body, c, run, delivery, hits)
 		stopKeepAlive()
 		if err == nil {
 			err = delivery.finish(response)
@@ -137,13 +137,21 @@ func (s *Service) executeStream(request ExecutorRequest, body map[string]any, c 
 	return map[string]any{"Headers": map[string][]string{"Content-Type": {"text/event-stream"}, "Cache-Control": {"no-cache"}}}, nil
 }
 
-func (s *Service) readStreamingResponse(request ExecutorRequest, body map[string]any, c credential, run *runningStream, delivery *streamDelivery) (map[string]any, error) {
+func (s *Service) readStreamingResponse(request ExecutorRequest, body map[string]any, c credential, run *runningStream, delivery *streamDelivery, hits *imageHits) (map[string]any, error) {
 	source, err := executorSource(request)
 	if err != nil {
 		return nil, err
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		response, err := s.readStreamAttempt(request, body, c, run, delivery)
+		if err != nil && !delivery.isCommitted() && retryableAttachmentReject(err) {
+			if retried, refreshErr := hits.refresh(s, request, body, c); refreshErr != nil {
+				return nil, refreshErr
+			} else if retried {
+				delivery.reset()
+				response, err = s.readStreamAttempt(request, body, c, run, delivery)
+			}
+		}
 		if err != nil {
 			return nil, err
 		}

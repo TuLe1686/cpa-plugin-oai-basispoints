@@ -160,14 +160,14 @@ func (s *Service) execute(raw json.RawMessage, stream bool) (any, error) {
 	if err := json.Unmarshal(raw, &request); err != nil {
 		return nil, fail(400, "invalid_request", "executor request is invalid")
 	}
-	body, credential, err := s.prepareRequest(request)
+	body, credential, hits, err := s.prepareRequestTracked(request)
 	if err != nil {
 		return nil, err
 	}
 	if stream {
-		return s.executeStream(request, body, credential)
+		return s.executeStream(request, body, credential, hits)
 	}
-	payload, response, headers, err := s.executeResponse(request, body, credential)
+	payload, response, headers, err := s.executeResponse(request, body, credential, hits)
 	if err != nil {
 		return nil, err
 	}
@@ -178,7 +178,7 @@ func (s *Service) execute(raw json.RawMessage, stream bool) (any, error) {
 }
 
 // 在交付任何客户端数据前完成全量校验，畸形调用只允许重生成一次。
-func (s *Service) executeResponse(request ExecutorRequest, body map[string]any, credential credential) ([]byte, map[string]any, http.Header, error) {
+func (s *Service) executeResponse(request ExecutorRequest, body map[string]any, credential credential, hits *imageHits) ([]byte, map[string]any, http.Header, error) {
 	run, err := s.startRun(request)
 	if err != nil {
 		return nil, nil, nil, err
@@ -199,6 +199,13 @@ func (s *Service) executeResponse(request ExecutorRequest, body map[string]any, 
 				return nil, nil, nil, err
 			}
 			upstream, openErr := s.upstreamRequest(request, body, credential, false)
+			if openErr != nil && retryableAttachmentReject(openErr) {
+				if retried, refreshErr := hits.refresh(s, request, body, credential); refreshErr != nil {
+					return nil, nil, nil, refreshErr
+				} else if retried {
+					upstream, openErr = s.upstreamRequest(request, body, credential, false)
+				}
+			}
 			if openErr != nil {
 				return nil, nil, nil, openErr
 			}
