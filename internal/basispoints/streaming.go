@@ -97,7 +97,7 @@ func (s *Service) stopStreams() {
 	s.streamWG.Wait()
 }
 
-func (s *Service) executeStream(request ExecutorRequest, body map[string]any, c credential) (any, error) {
+func (s *Service) executeStream(request ExecutorRequest, body map[string]any, c credential, hits *imageHits) (any, error) {
 	if request.StreamID == "" {
 		return nil, fail(500, "stream_id_missing", "executor.execute_stream requires stream_id")
 	}
@@ -114,7 +114,9 @@ func (s *Service) executeStream(request ExecutorRequest, body map[string]any, c 
 	}
 	go func() {
 		defer run.finish()
-		response, err := s.readStreamingResponse(request, body, c, run, delivery)
+		stopKeepAlive := delivery.startKeepAlive(time.Duration(s.config().StreamKeepAliveSeconds) * time.Second)
+		response, err := s.readStreamingResponse(request, body, c, run, delivery, hits)
+		stopKeepAlive()
 		if err == nil {
 			err = delivery.finish(response)
 		}
@@ -135,13 +137,21 @@ func (s *Service) executeStream(request ExecutorRequest, body map[string]any, c 
 	return map[string]any{"Headers": map[string][]string{"Content-Type": {"text/event-stream"}, "Cache-Control": {"no-cache"}}}, nil
 }
 
-func (s *Service) readStreamingResponse(request ExecutorRequest, body map[string]any, c credential, run *runningStream, delivery *streamDelivery) (map[string]any, error) {
+func (s *Service) readStreamingResponse(request ExecutorRequest, body map[string]any, c credential, run *runningStream, delivery *streamDelivery, hits *imageHits) (map[string]any, error) {
 	source, err := executorSource(request)
 	if err != nil {
 		return nil, err
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		response, err := s.readStreamAttempt(request, body, c, run, delivery)
+		if err != nil && !delivery.isCommitted() && retryableAttachmentReject(err) {
+			if retried, refreshErr := hits.refresh(s, request, body, c); refreshErr != nil {
+				return nil, refreshErr
+			} else if retried {
+				delivery.reset()
+				response, err = s.readStreamAttempt(request, body, c, run, delivery)
+			}
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -153,7 +163,7 @@ func (s *Service) readStreamingResponse(request ExecutorRequest, body map[string
 			return transformed, nil
 		}
 		var apiError *APIError
-		if delivery.committed || attempt != 0 || response["status"] == "incomplete" || !errors.As(err, &apiError) || apiError.Kind != "invalid_tool_call" {
+		if delivery.isCommitted() || attempt != 0 || response["status"] == "incomplete" || !errors.As(err, &apiError) || apiError.Kind != "invalid_tool_call" {
 			return nil, err
 		}
 		// 没有提交任何客户端数据的工具请求仍保留原有一次重生成；已经输出则绝不重跑。
@@ -161,7 +171,7 @@ func (s *Service) readStreamingResponse(request ExecutorRequest, body map[string
 		items, _ := body["input"].([]any)
 		retry["input"] = appendBeforeCompaction(append([]any{}, items...), []any{messageItem("developer", transportRetryHint+" Diagnostic: "+apiError.Message)})
 		body = retry
-		*delivery = *newStreamDelivery(delivery.format, delivery.start, delivery.write)
+		delivery.reset()
 	}
 	return nil, relayError("retry_exhausted")
 }
@@ -207,7 +217,7 @@ func (s *Service) readStreamAttempt(request ExecutorRequest, body map[string]any
 			return nil, timeoutError(cfg)
 		}
 		if chunk.Error != "" {
-			return nil, fail(502, "upstream_transport", "Basis Points stream interrupted: "+safeError(errors.New(chunk.Error)))
+			return s.completeCutoff(raw.Bytes(), fail(502, "upstream_transport", "Basis Points stream interrupted: "+safeError(errors.New(chunk.Error))))
 		}
 		if raw.Len()+len(chunk.Payload) > cfg.MaxResponseBytes {
 			return nil, fail(502, "upstream_response_too_large", "Basis Points response exceeds configured limit")
@@ -231,7 +241,7 @@ func (s *Service) readStreamAttempt(request ExecutorRequest, body map[string]any
 					return nil, err
 				}
 			}
-			return parseResponse(raw.Bytes(), upstream.Headers)
+			return s.parseUpstreamResponse(raw.Bytes(), upstream.Headers)
 		}
 	}
 }

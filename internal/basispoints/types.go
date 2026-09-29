@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	Version        = "0.2.7"
+	Version        = "0.2.8.1"
 	Provider       = "oai-basispoints"
 	AuthProviderID = "codex"
 	PluginID       = Provider
@@ -29,11 +29,16 @@ type APIError struct {
 	Status  int
 	Kind    string
 	Message string
+	Type    string
 }
 
 func (e *APIError) Error() string {
 	if e == nil {
 		return ""
+	}
+	// 宿主通过 JSON 错误正文识别请求错误；跨 ABI 后仍需保留安全分类。
+	if e.Type != "" {
+		return string(jsonBytes(map[string]any{"error": map[string]any{"type": e.Type, "code": e.Kind, "message": e.Message}}))
 	}
 	return e.Message
 }
@@ -124,6 +129,8 @@ type Config struct {
 	SmoothStream              bool              `yaml:"smooth_stream" json:"smooth_stream"`
 	SmoothChunkChars          int               `yaml:"smooth_chunk_chars" json:"smooth_chunk_chars"`
 	SmoothIntervalMs          int               `yaml:"smooth_interval_ms" json:"smooth_interval_ms"`
+	StreamKeepAliveSeconds    int               `yaml:"stream_keepalive_seconds" json:"stream_keepalive_seconds"`
+	CutoffCompletion          bool              `yaml:"cutoff_completion" json:"cutoff_completion"`
 }
 
 func defaultConfig() Config {
@@ -140,6 +147,7 @@ func defaultConfig() Config {
 		SmoothStream:              true,
 		SmoothChunkChars:          8,
 		SmoothIntervalMs:          20,
+		StreamKeepAliveSeconds:    45,
 	}
 }
 
@@ -178,6 +186,9 @@ func (c *Config) normalize() error {
 	}
 	if c.SmoothChunkChars < 0 || c.SmoothChunkChars > 256 {
 		return fail(400, "invalid_config", "smooth_chunk_chars must be between 0 and 256")
+	}
+	if c.StreamKeepAliveSeconds < 0 || c.StreamKeepAliveSeconds > 300 {
+		return fail(400, "invalid_config", "stream_keepalive_seconds must be between 0 and 300")
 	}
 	if c.SmoothIntervalMs < 0 || c.SmoothIntervalMs > 1000 {
 		return fail(400, "invalid_config", "smooth_interval_ms must be between 0 and 1000")
