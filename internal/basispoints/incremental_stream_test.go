@@ -65,18 +65,27 @@ func decodeIncrementalFrames(t *testing.T, format string, frames [][]byte) []map
 }
 
 func TestIncrementalFailureDoesNotRetryOrDeliverPartialToolBatch(t *testing.T) {
-	for _, format := range []string{"openai-response", "codex"} {
-		for _, mode := range []string{"invalid_tool", "upstream_failure", "transport_failure", "truncated", "changed_text", "size_limit", "incomplete_tool", "valid_tools"} {
-			t.Run(format+"/"+mode, func(t *testing.T) {
+	for _, scenario := range []string{"openai-response/text", "codex/text", "openai-response/reasoning", "codex/reasoning"} {
+		format, lead, _ := strings.Cut(scenario, "/")
+		for _, mode := range []string{"invalid_tool", "upstream_failure", "request_failure", "rate_limit_failure", "transport_failure", "truncated", "changed_text", "size_limit", "incomplete_tool", "valid_tools"} {
+			t.Run(scenario+"/"+mode, func(t *testing.T) {
 				good, patch := relayFixture(t.Name()+"-good", false)
 				bad, _ := relayFixture(t.Name()+"-bad", true)
 				text := "  你好\r\n"
-				response := incrementalTerminal(text, good, bad)
+				prefix := incrementalPrefix(text)
+				terminal := incrementalTerminal
+				if lead == "reasoning" {
+					prefix = reasoningStreamPrefix(text)
+					terminal = func(text string, tail ...any) map[string]any {
+						return map[string]any{"id": "resp_incremental", "status": "completed", "output": append([]any{reasoningStreamItem(text)}, tail...)}
+					}
+				}
+				response := terminal(text, good, bad)
 				switch mode {
 				case "valid_tools":
-					response = incrementalTerminal(text, good)
+					response = terminal(text, good)
 				case "changed_text":
-					response = incrementalTerminal("different", good)
+					response = terminal("different", good)
 				case "incomplete_tool":
 					response["status"] = "incomplete"
 				}
@@ -84,6 +93,10 @@ func TestIncrementalFailureDoesNotRetryOrDeliverPartialToolBatch(t *testing.T) {
 				switch mode {
 				case "upstream_failure":
 					last.Payload = streamFixtureEvents(map[string]any{"type": "response.failed", "response": map[string]any{"error": map[string]any{"message": "private-upstream-message"}}})
+				case "request_failure":
+					last.Payload = streamFixtureEvents(map[string]any{"type": "response.failed", "response": map[string]any{"error": map[string]any{"code": "context_length_exceeded", "message": "private-upstream-message"}}})
+				case "rate_limit_failure":
+					last.Payload = streamFixtureEvents(map[string]any{"type": "error", "status": 429, "error": map[string]any{"type": "rate_limit_error", "message": "private-upstream-message"}})
 				case "transport_failure":
 					last.Payload, last.Error = nil, "connection reset"
 				case "truncated":
@@ -107,7 +120,7 @@ func TestIncrementalFailureDoesNotRetryOrDeliverPartialToolBatch(t *testing.T) {
 					case "host.http.stream_read":
 						reads++
 						if reads == 1 {
-							*out.(*streamChunk) = streamChunk{Payload: incrementalPrefix(text)}
+							*out.(*streamChunk) = streamChunk{Payload: prefix}
 						} else {
 							*out.(*streamChunk) = last
 						}
@@ -146,7 +159,7 @@ func TestIncrementalFailureDoesNotRetryOrDeliverPartialToolBatch(t *testing.T) {
 				var actual string
 				tools, failures, terminals := 0, 0, 0
 				for _, event := range events {
-					if event["type"] == "response.output_text.delta" {
+					if event["type"] == "response.output_text.delta" || event["type"] == "response.reasoning_summary_text.delta" {
 						actual += event["delta"].(string)
 					}
 					if event["type"] == "response.output_item.added" {
@@ -159,6 +172,12 @@ func TestIncrementalFailureDoesNotRetryOrDeliverPartialToolBatch(t *testing.T) {
 						failures++
 						if strings.Contains(string(jsonBytes(event)), "private-upstream-message") {
 							t.Fatal("leaked upstream failure body")
+						}
+						if mode == "request_failure" && (event["status"] != float64(400) || objectValue(event["error"])["code"] != "context_length_exceeded") {
+							t.Fatalf("request failure classification lost after output: %v", event)
+						}
+						if mode == "rate_limit_failure" && (event["status"] != float64(429) || objectValue(event["error"])["type"] != "rate_limit_error") {
+							t.Fatalf("rate limit misclassified after output: %v", event)
 						}
 					}
 					if event["type"] == "response.completed" || event["type"] == "response.incomplete" {

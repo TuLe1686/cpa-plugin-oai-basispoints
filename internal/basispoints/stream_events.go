@@ -22,7 +22,14 @@ type streamedMessage struct {
 	done  bool
 }
 
-// 只提前交付普通消息；任何工具名称和参数均等待完整终态及整批校验。
+type streamedReasoning struct {
+	id          string
+	summaries   map[int]*streamedPart
+	done        bool
+	doneSummary []any
+}
+
+// 提前交付普通消息和推理摘要；任何工具名称和参数均等待完整终态及整批校验。
 type streamDelivery struct {
 	format        string
 	start         func()
@@ -35,6 +42,7 @@ type streamDelivery struct {
 	knownMessages map[int]string
 	knownParts    map[[2]int]bool
 	messages      map[int]*streamedMessage
+	reasonings    map[int]*streamedReasoning
 	terminal      bool
 	sentinel      bool
 	pacer         *deltaPacer
@@ -44,7 +52,7 @@ type streamDelivery struct {
 }
 
 func newStreamDelivery(format string, start func(), write func([]byte) error) *streamDelivery {
-	return &streamDelivery{format: format, start: start, write: write, knownMessages: map[int]string{}, knownParts: map[[2]int]bool{}, messages: map[int]*streamedMessage{}}
+	return &streamDelivery{format: format, start: start, write: write, knownMessages: map[int]string{}, knownParts: map[[2]int]bool{}, messages: map[int]*streamedMessage{}, reasonings: map[int]*streamedReasoning{}}
 }
 
 // enableSmoothing 接入正文平滑器；在首个文本增量前调用一次。
@@ -61,7 +69,7 @@ func (d *streamDelivery) enableSmoothing(pacer *deltaPacer) {
 }
 
 func streamEventError() error {
-	return fail(502, "invalid_upstream_stream", "Basis Points stream contains inconsistent message events")
+	return fail(502, "invalid_upstream_stream", "Basis Points stream contains inconsistent output events")
 }
 
 func streamIndex(value any) (int, error) {
@@ -95,7 +103,7 @@ func (d *streamDelivery) consume(event, data string) error {
 	}
 	switch kind {
 	case "error", "response.failed", "response.cancelled":
-		return fail(502, "upstream_response_failed", "Basis Points stream reported a failure")
+		return upstreamFailure(kind, value)
 	case "response.completed", "response.incomplete":
 		d.terminal = true
 		return nil
@@ -110,15 +118,23 @@ func (d *streamDelivery) consume(event, data string) error {
 		return nil
 	case "response.output_item.added", "response.output_item.done":
 		item := objectValue(value["item"])
-		if stringValue(item["type"]) != "message" {
+		itemType := stringValue(item["type"])
+		if itemType != "message" && itemType != "reasoning" {
 			return nil
 		}
 		index, err := streamIndex(value["output_index"])
 		if err != nil {
 			return err
 		}
-		if kind == "response.output_item.added" {
+		if kind == "response.output_item.added" && itemType == "message" {
 			d.knownMessages[index] = stringValue(item["id"])
+		}
+	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done", "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done":
+		if _, err := streamIndex(value["output_index"]); err != nil {
+			return err
+		}
+		if _, err := streamIndex(value["summary_index"]); err != nil {
+			return err
 		}
 	case "response.content_part.added", "response.content_part.done", "response.output_text.delta", "response.output_text.done":
 		index, err := streamIndex(value["output_index"])
@@ -133,11 +149,11 @@ func (d *streamDelivery) consume(event, data string) error {
 			d.knownParts[[2]int{index, part}] = stringValue(objectValue(value["part"])["type"]) == "output_text"
 		}
 	default:
-		// reasoning 密文、工具增量及其他终态信息由完整响应保留，不作为正文暴露。
+		// 工具增量及其他终态信息由完整响应保留，不作为正文暴露。
 		return nil
 	}
 	if d.committed {
-		frame, err := d.applyMessageEvent(value)
+		frame, err := d.applyEvent(value)
 		if err != nil {
 			return err
 		}
@@ -145,17 +161,19 @@ func (d *streamDelivery) consume(event, data string) error {
 	}
 	d.pending = append(d.pending, value)
 	delta, _ := value["delta"].(string)
-	if kind != "response.output_text.delta" || delta == "" || d.meta == nil {
+	if (kind != "response.output_text.delta" && kind != "response.reasoning_summary_text.delta") || delta == "" || d.meta == nil {
 		return nil
 	}
-	index, _ := streamIndex(value["output_index"])
-	part, _ := streamIndex(value["content_index"])
-	if d.knownMessages[index] == "" || d.knownMessages[index] != stringValue(value["item_id"]) || !d.knownParts[[2]int{index, part}] {
-		return nil
+	if kind == "response.output_text.delta" {
+		index, _ := streamIndex(value["output_index"])
+		part, _ := streamIndex(value["content_index"])
+		if d.knownMessages[index] == "" || d.knownMessages[index] != stringValue(value["item_id"]) || !d.knownParts[[2]int{index, part}] {
+			return nil
+		}
 	}
 	frames := make([]map[string]any, 0, len(d.pending))
 	for _, item := range d.pending {
-		frame, err := d.applyMessageEvent(item)
+		frame, err := d.applyEvent(item)
 		if err != nil {
 			return err
 		}
@@ -179,6 +197,108 @@ func (d *streamDelivery) consume(event, data string) error {
 	return nil
 }
 
+func (d *streamDelivery) applyEvent(value map[string]any) (map[string]any, error) {
+	kind := stringValue(value["type"])
+	if strings.HasPrefix(kind, "response.reasoning_summary_") ||
+		((kind == "response.output_item.added" || kind == "response.output_item.done") && objectValue(value["item"])["type"] == "reasoning") {
+		return d.applyReasoningEvent(value)
+	}
+	return d.applyMessageEvent(value)
+}
+
+// 推理条目保持原样，使用独立状态记录交付进度，不能登记为普通消息。
+func (d *streamDelivery) applyReasoningEvent(value map[string]any) (map[string]any, error) {
+	index, err := streamIndex(value["output_index"])
+	if err != nil {
+		return nil, err
+	}
+	kind := stringValue(value["type"])
+	r := d.reasonings[index]
+	if kind == "response.output_item.added" {
+		id := stringValue(objectValue(value["item"])["id"])
+		if r != nil || d.messages[index] != nil || id == "" {
+			return nil, streamEventError()
+		}
+		d.reasonings[index] = &streamedReasoning{id: id, summaries: map[int]*streamedPart{}}
+		return value, nil
+	}
+	if r == nil || r.done {
+		return nil, streamEventError()
+	}
+	if kind == "response.output_item.done" {
+		if err := r.validateItem(objectValue(value["item"])); err != nil {
+			return nil, err
+		}
+		for _, part := range r.summaries {
+			if !part.done {
+				return nil, streamEventError()
+			}
+		}
+		r.done = true
+		r.doneSummary, _ = objectValue(value["item"])["summary"].([]any)
+		return value, nil
+	}
+	if value["item_id"] != r.id {
+		return nil, streamEventError()
+	}
+	partIndex, err := streamIndex(value["summary_index"])
+	if err != nil {
+		return nil, err
+	}
+	part := r.summaries[partIndex]
+	if kind == "response.reasoning_summary_part.added" {
+		if part != nil || partIndex != len(r.summaries) || (partIndex > 0 && !r.summaries[partIndex-1].done) || objectValue(value["part"])["type"] != "summary_text" {
+			return nil, streamEventError()
+		}
+		r.summaries[partIndex] = &streamedPart{kind: "summary_text"}
+		return value, nil
+	}
+	if part == nil || part.done {
+		return nil, streamEventError()
+	}
+	switch kind {
+	case "response.reasoning_summary_text.delta":
+		text, ok := value["delta"].(string)
+		if !ok || part.textDone {
+			return nil, streamEventError()
+		}
+		part.text.WriteString(text)
+	case "response.reasoning_summary_text.done":
+		if part.textDone || value["text"] != part.text.String() {
+			return nil, streamEventError()
+		}
+		part.textDone = true
+	case "response.reasoning_summary_part.done":
+		completed := objectValue(value["part"])
+		if !part.textDone || completed["type"] != "summary_text" || completed["text"] != part.text.String() {
+			return nil, streamEventError()
+		}
+		part.done = true
+	}
+	return value, nil
+}
+
+func (r *streamedReasoning) validateItem(item map[string]any) error {
+	if item["type"] != "reasoning" || item["id"] != r.id {
+		return streamEventError()
+	}
+	summaries, _ := item["summary"].([]any)
+	if r.done && !bytes.Equal(jsonBytes(summaries), jsonBytes(r.doneSummary)) {
+		return streamEventError()
+	}
+	for i, part := range r.summaries {
+		if i >= len(summaries) {
+			return streamEventError()
+		}
+		finalPart := objectValue(summaries[i])
+		text, ok := finalPart["text"].(string)
+		if finalPart["type"] != "summary_text" || !ok || !strings.HasPrefix(text, part.text.String()) || (part.textDone && text != part.text.String()) {
+			return streamEventError()
+		}
+	}
+	return nil
+}
+
 func (d *streamDelivery) applyMessageEvent(value map[string]any) (map[string]any, error) {
 	index, err := streamIndex(value["output_index"])
 	if err != nil {
@@ -190,7 +310,7 @@ func (d *streamDelivery) applyMessageEvent(value map[string]any) (map[string]any
 	if kind == "response.output_item.added" {
 		item := objectValue(value["item"])
 		id := stringValue(item["id"])
-		if m != nil || id == "" {
+		if m != nil || d.reasonings[index] != nil || id == "" {
 			return nil, streamEventError()
 		}
 		d.messages[index] = &streamedMessage{id: id, parts: map[int]*streamedPart{}}
@@ -279,6 +399,14 @@ func (d *streamDelivery) validateFinal(response map[string]any) error {
 		return streamEventError()
 	}
 	output, _ := response["output"].([]any)
+	for index, reasoning := range d.reasonings {
+		if index >= len(output) {
+			return streamEventError()
+		}
+		if err := reasoning.validateItem(objectValue(output[index])); err != nil {
+			return err
+		}
+	}
 	for index, message := range d.messages {
 		if index >= len(output) {
 			return streamEventError()
@@ -401,6 +529,32 @@ func (d *streamDelivery) finish(response map[string]any) error {
 			return nil
 		}
 		index, indexErr := streamIndex(value["output_index"])
+		if reasoning := d.reasonings[index]; indexErr == nil && reasoning != nil {
+			if reasoning.done || kind == "response.output_item.added" {
+				return nil
+			}
+			partIndex, partErr := streamIndex(value["summary_index"])
+			if part := reasoning.summaries[partIndex]; partErr == nil && part != nil {
+				switch kind {
+				case "response.reasoning_summary_part.added":
+					return nil
+				case "response.reasoning_summary_text.delta":
+					text := value["delta"].(string)[part.text.Len():]
+					if text == "" {
+						return nil
+					}
+					value["delta"] = text
+				case "response.reasoning_summary_text.done":
+					if part.textDone {
+						return nil
+					}
+				case "response.reasoning_summary_part.done":
+					if part.done {
+						return nil
+					}
+				}
+			}
+		}
 		message := d.messages[index]
 		if indexErr == nil && message != nil {
 			if kind == "response.output_item.added" || (kind == "response.output_item.done" && message.done) {
@@ -443,13 +597,15 @@ func (d *streamDelivery) finish(response map[string]any) error {
 
 func (d *streamDelivery) fail(err error) error {
 	d.drainPacer()
-	kind, message, errorType := "stream_failed", "Basis Points stream failed after response delivery began", "api_error"
+	kind, message, status := "stream_failed", "Basis Points stream failed after response delivery began", 502
+	errorType := upstreamErrorType(status)
 	var api *APIError
 	if errors.As(err, &api) {
-		kind, message = api.Kind, api.Message
-		if api.Status >= 400 && api.Status < 500 {
-			errorType = "invalid_request_error"
+		kind, message, status = api.Kind, api.Message, api.Status
+		errorType = upstreamErrorType(status)
+		if api.Type != "" {
+			errorType = api.Type
 		}
 	}
-	return d.emit(map[string]any{"type": "error", "code": kind, "message": message, "param": nil, "error": map[string]any{"type": errorType, "code": kind, "message": message}})
+	return d.emit(map[string]any{"type": "error", "status": status, "code": kind, "message": message, "param": nil, "error": map[string]any{"type": errorType, "code": kind, "message": message}})
 }
