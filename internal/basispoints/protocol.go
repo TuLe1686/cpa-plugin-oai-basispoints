@@ -152,6 +152,9 @@ func clientToolProtocolInstructions(source map[string]any) string {
 			if parameters := firstMap(spec.Spec, "parameters", "inputSchema", "input_schema"); parameters != nil {
 				line += ". Its arguments are an object with " + describeParameterNames(parameters) + ". JSON Schema: " + string(jsonBytes(parameters))
 			}
+			if field, ok := singleStringArgument(spec); ok {
+				line += ". Raw text accepted: code may be the exact " + field + " text itself"
+			}
 		} else {
 			line += ". It receives raw text in input."
 			if format := objectValue(spec.Spec["format"]); format != nil {
@@ -854,7 +857,14 @@ func extractNativeClientToolCallIn(native map[string]any, callable, declared map
 		result["id"] = "ctc_" + strings.TrimPrefix(stringValue(result["id"]), "fc_")
 		result["input"] = inner["args"]
 	} else {
-		parsed, reason := parseRelayObject(inner["args"])
+		code, _ := inner["args"].(string)
+		var parsed map[string]any
+		reason := ""
+		if field, raw := singleStringArgument(spec); raw && !looksLikeJSONObject(code) {
+			parsed = map[string]any{field: code}
+		} else {
+			parsed, reason = parseRelayObject(code)
+		}
 		if reason != "" {
 			return nil, relayError("code " + reason)
 		}
