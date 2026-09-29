@@ -57,6 +57,12 @@ plugins:
       # 条目未完成、只有 commentary 前言或上游报错时不补。补全的用量可能缺失。
       cutoff_completion: false
 
+      # 缓存写入计数置 0，默认关闭。Basis Points 的 input_tokens 已包含 cache_write_tokens；
+      # 下游若按「缓存创建与输入分开计价」（Anthropic 口径网关、new-api 等）会把这部分重复计费。
+      # 打开后只把下发给客户端的 input_tokens_details.cache_write_tokens 改为 0，input_tokens 与 cached_tokens 不变。
+      # CPA 不统计插件执行器的 token，本开关不影响 CPA 侧用量。
+      cache_write_as_input: false
+
       # 正文平滑（fork 扩展）：把上游大块正文拆成小增量按节奏放行，默认开启。
       smooth_stream: true
       smooth_chunk_chars: 8

@@ -220,6 +220,10 @@ func (s *Service) executeResponse(request ExecutorRequest, body map[string]any, 
 			}
 		}
 		payload, transformed, _, transformErr := transformResponseBody(jsonBytes(response), source)
+		if transformErr == nil && s.config().CacheWriteAsInput {
+			stripCacheWriteTokens(transformed)
+			payload = jsonBytes(transformed)
+		}
 		if transformErr == nil {
 			// 结果已重新编码，不能继续使用上游 SSE/压缩/长度等实体头。
 			resultHeaders := headers.Clone()

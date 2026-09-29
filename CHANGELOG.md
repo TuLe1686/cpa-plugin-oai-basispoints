@@ -1,5 +1,11 @@
 # 更新日志
 
+## v0.2.8.2 — 2026-09-30（UTC+8，TuLe1686 fork）
+
+- 新增 `cache_write_as_input`（默认关闭）：打开后把下发给客户端的 `input_tokens_details.cache_write_tokens`（及 `prompt_tokens_details` 同名字段）置 0，`input_tokens`、`cached_tokens`、`total_tokens` 不变。Basis Points 首轮请求会把大部分输入报成缓存写入（实测 22374 输入里 22306 为写入），而这部分已计入 `input_tokens`；按缓存创建另行计价的下游会重复计费。参考 codex2api #744 的 `codex_basispoints_cache_creation_as_input`。
+- 非流式与流式终态都生效。CPA 宿主不统计插件执行器的 token（用量记录为 0），开关只影响客户端看到的数字。
+- 验证：`go test -race ./...` 通过，新增字段改写、默认关闭、非流式、流式终态与完整 `executor.execute_stream` 回归。
+
 ## v0.2.8.1 — 2026-09-29（UTC+8，TuLe1686 fork）
 
 基于上游 v0.2.8，保留 fork 正文平滑器，并参考 CodexProxy #734 移植四项容错。版本号比上游 0.2.8 多一段，CPA 按数字段比较时会优先加载本版。
