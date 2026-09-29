@@ -217,7 +217,7 @@ func (s *Service) readStreamAttempt(request ExecutorRequest, body map[string]any
 			return nil, timeoutError(cfg)
 		}
 		if chunk.Error != "" {
-			return nil, fail(502, "upstream_transport", "Basis Points stream interrupted: "+safeError(errors.New(chunk.Error)))
+			return s.completeCutoff(raw.Bytes(), fail(502, "upstream_transport", "Basis Points stream interrupted: "+safeError(errors.New(chunk.Error))))
 		}
 		if raw.Len()+len(chunk.Payload) > cfg.MaxResponseBytes {
 			return nil, fail(502, "upstream_response_too_large", "Basis Points response exceeds configured limit")
@@ -241,7 +241,7 @@ func (s *Service) readStreamAttempt(request ExecutorRequest, body map[string]any
 					return nil, err
 				}
 			}
-			return parseResponse(raw.Bytes(), upstream.Headers)
+			return s.parseUpstreamResponse(raw.Bytes(), upstream.Headers)
 		}
 	}
 }

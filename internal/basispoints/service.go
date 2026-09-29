@@ -214,7 +214,7 @@ func (s *Service) executeResponse(request ExecutorRequest, body map[string]any, 
 				return nil, nil, nil, fail(502, "upstream_response_too_large", "Basis Points response exceeds configured limit")
 			}
 			var parseErr error
-			response, parseErr = parseResponse(upstream.Body, headers)
+			response, parseErr = s.parseUpstreamResponse(upstream.Body, headers)
 			if parseErr != nil {
 				return nil, nil, nil, parseErr
 			}

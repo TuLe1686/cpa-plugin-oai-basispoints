@@ -130,6 +130,7 @@ type Config struct {
 	SmoothChunkChars          int               `yaml:"smooth_chunk_chars" json:"smooth_chunk_chars"`
 	SmoothIntervalMs          int               `yaml:"smooth_interval_ms" json:"smooth_interval_ms"`
 	StreamKeepAliveSeconds    int               `yaml:"stream_keepalive_seconds" json:"stream_keepalive_seconds"`
+	CutoffCompletion          bool              `yaml:"cutoff_completion" json:"cutoff_completion"`
 }
 
 func defaultConfig() Config {

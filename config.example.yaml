@@ -52,6 +52,11 @@ plugins:
       # 避免客户端空闲超时；代价是该请求放弃未开流时的一次工具重生成。
       stream_keepalive_seconds: 45
 
+      # 截断补全，默认关闭。上游 SSE 在最终回答或工具调用完成后、终态事件前断开时，
+      # 用已完成条目在本地补一个 completed 终态，并记录 basispoints_cutoff_completed 日志。
+      # 条目未完成、只有 commentary 前言或上游报错时不补。补全的用量可能缺失。
+      cutoff_completion: false
+
       # 正文平滑（fork 扩展）：把上游大块正文拆成小增量按节奏放行，默认开启。
       smooth_stream: true
       smooth_chunk_chars: 8
