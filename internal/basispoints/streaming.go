@@ -160,6 +160,9 @@ func (s *Service) readStreamingResponse(request ExecutorRequest, body map[string
 		}
 		_, transformed, _, err := transformResponseBody(jsonBytes(response), source)
 		if err == nil {
+			if s.config().CacheWriteAsInput {
+				stripCacheWriteTokens(transformed)
+			}
 			return transformed, nil
 		}
 		var apiError *APIError

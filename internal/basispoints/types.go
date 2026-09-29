@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	Version        = "0.2.8.1"
+	Version        = "0.2.8.2"
 	Provider       = "oai-basispoints"
 	AuthProviderID = "codex"
 	PluginID       = Provider
@@ -131,6 +131,7 @@ type Config struct {
 	SmoothIntervalMs          int               `yaml:"smooth_interval_ms" json:"smooth_interval_ms"`
 	StreamKeepAliveSeconds    int               `yaml:"stream_keepalive_seconds" json:"stream_keepalive_seconds"`
 	CutoffCompletion          bool              `yaml:"cutoff_completion" json:"cutoff_completion"`
+	CacheWriteAsInput         bool              `yaml:"cache_write_as_input" json:"cache_write_as_input"`
 }
 
 func defaultConfig() Config {
