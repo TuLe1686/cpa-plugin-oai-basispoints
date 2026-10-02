@@ -91,7 +91,7 @@ func TestWebSocketSubmittedFailuresNeverFallBack(t *testing.T) {
 						}
 					}))
 					defer server.Close()
-					svc := NewService()
+					svc := newVirtualTestService()
 					svc.cfg.ResponsesURL = server.URL
 					// 平滑器只改变到达节奏；本文件断言回退与重放语义，关闭以保持时序稳定。
 					svc.cfg.SmoothStream = false
@@ -173,7 +173,7 @@ func TestWebSocketLifecycleCancelsHandshakeAndPendingResponse(t *testing.T) {
 			}))
 			defer server.Close()
 			defer close(release)
-			svc := NewService()
+			svc := newVirtualTestService()
 			svc.cfg.ResponsesURL = server.URL
 			capture := &websocketCapture{closed: make(chan struct{}, 1)}
 			svc.SetHost(capture.host)
@@ -245,7 +245,7 @@ func TestWebSocketHandshakeTimeoutFallsBackOnce(t *testing.T) {
 	}))
 	defer server.Close()
 	defer close(release)
-	svc := NewService()
+	svc := newVirtualTestService()
 	svc.cfg.ResponsesURL, svc.cfg.WSHandshakeTimeoutSeconds = server.URL, 1
 	capture := &websocketCapture{closed: make(chan struct{}, 1)}
 	svc.SetHost(capture.host)
@@ -279,7 +279,7 @@ func TestWebSocketGenerationTimeoutDoesNotFallBack(t *testing.T) {
 	}))
 	defer server.Close()
 	defer close(release)
-	svc := NewService()
+	svc := newVirtualTestService()
 	svc.cfg.ResponsesURL, svc.cfg.TimeoutSeconds = server.URL, 1
 	capture := &websocketCapture{closed: make(chan struct{}, 1)}
 	svc.SetHost(capture.host)
@@ -311,7 +311,7 @@ func TestWebSocketApplicationErrorsPreserveStatusWithoutReplay(t *testing.T) {
 					_ = conn.WriteJSON(map[string]any{"type": "error", "status": status, "error": map[string]any{"message": "upstream rejected this request"}})
 				}))
 				defer server.Close()
-				svc := NewService()
+				svc := newVirtualTestService()
 				svc.cfg.ResponsesURL = server.URL
 				capture := &websocketCapture{closed: make(chan struct{}, 1)}
 				svc.SetHost(capture.host)
@@ -368,7 +368,7 @@ func TestWebSocketFailureEventsPreserveClassification(t *testing.T) {
 						}
 					}))
 					defer server.Close()
-					svc := NewService()
+					svc := newVirtualTestService()
 					svc.cfg.ResponsesURL = server.URL
 					capture := &websocketCapture{closed: make(chan struct{}, 1)}
 					svc.SetHost(capture.host)
@@ -441,7 +441,7 @@ func TestWebSocketToolRegenerationRemainsBounded(t *testing.T) {
 				_ = conn.WriteJSON(map[string]any{"type": "response.completed", "response": incrementalTerminal("hello", bad)})
 			}))
 			defer server.Close()
-			svc := NewService()
+			svc := newVirtualTestService()
 			svc.cfg.ResponsesURL = server.URL
 			capture := &websocketCapture{closed: make(chan struct{}, 1)}
 			svc.SetHost(capture.host)

@@ -352,16 +352,14 @@ func (s *Service) uploadImage(request ExecutorRequest, endpoint string, image in
 	if err := writer.Close(); err != nil {
 		return "", fail(500, "attachment_encoding", "cannot finish image attachment")
 	}
-	headers := authHeaders(c, false)
+	headers := responseHeaders(c, false)
 	headers.Set("Content-Type", writer.FormDataContentType())
-	var response upstreamResponse
-	if err := s.call("host.http.do", map[string]any{
-		"host_callback_id": request.HostCallbackID,
-		"method":           http.MethodPost,
-		"url":              endpoint,
-		"headers":          headers,
-		"body":             body.Bytes(),
-	}, &response); err != nil {
+	response, err := s.doHTTP(request, endpoint, headers, body.Bytes())
+	if err != nil {
+		var apiError *APIError
+		if errors.As(err, &apiError) {
+			return "", apiError
+		}
 		return "", fail(502, "attachment_transport", "Basis Points attachment upload transport failed: "+attachmentErrorMessage([]byte(err.Error()), c, image))
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
@@ -377,11 +375,18 @@ func (s *Service) uploadImage(request ExecutorRequest, endpoint string, image in
 }
 
 func attachmentErrorMessage(raw []byte, c credential, image inlineImage) string {
-	message := string(raw)
-	for _, secret := range []string{c.AccessToken, c.AccountID, c.Email, base64.StdEncoding.EncodeToString(image.data), string(image.data)} {
+	// Redact long credentials and image data before truncating the raw body, then redact
+	// the decoded message again for JSON-escaped dynamic headers and image data.
+	message := redactAttachmentSecrets(c.redactMessage(string(raw)), image)
+	message = c.redactMessage(errorMessage([]byte(message)))
+	return redactTokenMessage(redactAttachmentSecrets(message, image))
+}
+
+func redactAttachmentSecrets(message string, image inlineImage) string {
+	for _, secret := range []string{base64.StdEncoding.EncodeToString(image.data), string(image.data)} {
 		if secret != "" {
 			message = strings.ReplaceAll(message, secret, "[REDACTED]")
 		}
 	}
-	return redactTokenMessage(errorMessage([]byte(message)))
+	return message
 }

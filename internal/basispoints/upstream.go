@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"net/http"
 	"strings"
 	"time"
 )
@@ -54,56 +53,14 @@ func (s *Service) prepareRequestTracked(request ExecutorRequest) (map[string]any
 	return prepared, c, hits, nil
 }
 
-func authHeaders(c credential, stream bool) http.Header {
-	accept := "application/json"
-	if stream {
-		accept = "text/event-stream"
-	}
-	// These headers match the Excel/Basis Points client profile. The access
-	// token itself is never logged by this plugin.
-	return http.Header{
-		"Authorization":           []string{"Bearer " + c.AccessToken},
-		"ChatGPT-Account-ID":      []string{c.AccountID},
-		"X-OpenAI-Account-ID":     []string{c.AccountID},
-		"X-Basispoints-Auth-Mode": []string{c.AuthMode},
-		"Content-Type":            []string{"application/json"},
-		"Accept":                  []string{accept},
-		"Accept-Encoding":         []string{"identity"},
-		"Origin":                  []string{"https://bps.openai.com"},
-		"X-OpenAI-Internal-Basispoints-Client-Agent-Profile":  []string{"excel"},
-		"X-OpenAI-Internal-Basispoints-Client-Editor":         []string{"excel"},
-		"X-OpenAI-Internal-Basispoints-Client-Host":           []string{"office"},
-		"X-OpenAI-Internal-Basispoints-Client-Platform":       []string{"excel"},
-		"X-OpenAI-Internal-Basispoints-Client-Platform-Class": []string{"PC"},
-		"X-OpenAI-Internal-Basispoints-Client-Product":        []string{"basispoints-excel-plugin"},
-		"X-OpenAI-Internal-Basispoints-Client-Runtime":        []string{"desktop"},
-		"X-OpenAI-Internal-Basispoints-Office-Host":           []string{"Excel"},
-		"X-OpenAI-Internal-Basispoints-Office-Platform":       []string{"PC"},
-		"X-Stainless-Arch":            []string{"unknown"},
-		"X-Stainless-Lang":            []string{"js"},
-		"X-Stainless-OS":              []string{"Unknown"},
-		"X-Stainless-Package-Version": []string{"6.31.0"},
-		"X-Stainless-Retry-Count":     []string{"0"},
-		"X-Stainless-Runtime":         []string{"browser:chrome"},
-		"User-Agent":                  []string{"oai-basispoints/" + Version},
-	}
-}
-
 func (s *Service) upstreamRequest(request ExecutorRequest, body map[string]any, c credential, stream bool) (upstreamResponse, error) {
 	cfg := s.config()
 	if cfg.ResponsesURL == "" {
 		return upstreamResponse{}, fail(500, "invalid_config", "responses_url is empty")
 	}
-	payload := map[string]any{
-		"host_callback_id": request.HostCallbackID,
-		"method":           http.MethodPost,
-		"url":              cfg.ResponsesURL,
-		"headers":          authHeaders(c, stream),
-		"body":             jsonBytes(body),
-	}
-	var response upstreamResponse
-	if err := s.call("host.http.do", payload, &response); err != nil {
-		return upstreamResponse{}, fail(502, "upstream_transport", "Basis Points transport failed: "+safeError(err))
+	response, err := s.doHTTP(request, cfg.ResponsesURL, responseHeaders(c, stream), jsonBytes(body))
+	if err != nil {
+		return upstreamResponse{}, transportError(err, "upstream_transport", "Basis Points transport failed: ")
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return response, upstreamRequestError(response.StatusCode, response.Body, body, c)
@@ -113,18 +70,11 @@ func (s *Service) upstreamRequest(request ExecutorRequest, body map[string]any, 
 
 func (s *Service) upstreamStream(request ExecutorRequest, body map[string]any, c credential) (upstreamStream, error) {
 	cfg := s.config()
-	payload := map[string]any{
-		"host_callback_id": request.HostCallbackID,
-		"method":           http.MethodPost,
-		"url":              cfg.ResponsesURL,
-		"headers":          authHeaders(c, true),
-		"body":             jsonBytes(body),
+	stream, err := s.openHTTPStream(request, cfg.ResponsesURL, responseHeaders(c, true), jsonBytes(body))
+	if err != nil {
+		return stream, transportError(err, "upstream_transport", "Basis Points stream transport failed: ")
 	}
-	var stream upstreamStream
-	if err := s.call("host.http.do_stream", payload, &stream); err != nil {
-		return stream, fail(502, "upstream_transport", "Basis Points stream transport failed: "+safeError(err))
-	}
-	if stream.StreamID == "" {
+	if stream.StreamID == "" && stream.local == nil {
 		return stream, fail(502, "upstream_transport", "host returned no Basis Points stream ID")
 	}
 	if stream.StatusCode < 200 || stream.StatusCode >= 300 {
@@ -147,19 +97,19 @@ func safeError(err error) string {
 
 func (s *Service) readUpstreamStream(stream upstreamStream) ([]byte, error) {
 	cfg := s.config()
-	if stream.StreamID == "" {
+	if stream.StreamID == "" && stream.local == nil {
 		return nil, fail(502, "upstream_transport", "upstream stream ID is empty")
 	}
-	defer func() { _ = s.call("host.http.stream_close", map[string]any{"stream_id": stream.StreamID}, nil) }()
+	defer s.closeHTTPStream(stream)
 	deadline := time.Now().Add(time.Duration(cfg.TimeoutSeconds) * time.Second)
 	var buffer bytes.Buffer
 	for {
 		if time.Now().After(deadline) {
 			return nil, timeoutError(cfg)
 		}
-		var chunk streamChunk
-		if err := s.call("host.http.stream_read", map[string]any{"stream_id": stream.StreamID}, &chunk); err != nil {
-			return nil, fail(502, "upstream_transport", "Basis Points stream read failed: "+safeError(err))
+		chunk, err := s.readHTTPStream(stream)
+		if err != nil {
+			return nil, transportError(err, "upstream_transport", "Basis Points stream read failed: ")
 		}
 		if chunk.Error != "" {
 			return nil, fail(502, "upstream_transport", "Basis Points stream interrupted: "+safeError(errors.New(chunk.Error)))
@@ -218,13 +168,10 @@ func (d *sseDecoder) feed(chunk []byte, emit func(event, data string) error) err
 
 // 仅附加非敏感摘要，不记录对话正文、图片内容或认证信息。
 func upstreamRequestError(status int, raw []byte, body map[string]any, c credential) error {
-	redacted := string(raw)
-	for _, secret := range []string{c.AccessToken, c.AccountID, c.Email} {
-		if secret != "" {
-			redacted = strings.ReplaceAll(redacted, secret, "[REDACTED]")
-		}
-	}
-	message := redactTokenMessage(errorMessage([]byte(redacted)))
+	// Redact the raw body before errorMessage truncates it so long credentials cannot
+	// leak; redact the decoded message again for dynamic headers containing quotes or escapes.
+	message := errorMessage([]byte(c.redactMessage(string(raw))))
+	message = c.redactMessage(message)
 	images, originalDetails := 0, 0
 	var imageRefs []string
 	items, _ := body["input"].([]any)

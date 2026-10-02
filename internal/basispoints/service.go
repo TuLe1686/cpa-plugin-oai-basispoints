@@ -12,17 +12,19 @@ import (
 )
 
 type Service struct {
-	attachments attachmentCache
-	mu          sync.RWMutex
-	cfg         Config
-	host        HostCall
-	stopped     bool
-	streams     map[*runningStream]struct{}
-	streamWG    sync.WaitGroup
-	requests    map[string]*requestScope
-	authEditMu  sync.Mutex
-	authDir     string
-	authPage    string
+	attachments       attachmentCache
+	mu                sync.RWMutex
+	cfg               Config
+	host              HostCall
+	stopped           bool
+	streams           map[*runningStream]struct{}
+	streamWG          sync.WaitGroup
+	requests          map[string]*requestScope
+	hostProxyURL      string
+	hostReady         bool
+	credentialMu      sync.Mutex
+	lastCredential    string
+	credentialClients map[string]credentialHTTPClient
 }
 
 func NewService() *Service {
@@ -106,17 +108,12 @@ func (s *Service) Handle(method string, raw json.RawMessage) (any, error) {
 		if err := json.Unmarshal(raw, &request); err != nil {
 			return nil, err
 		}
-		result, err := parseAuthRequest(request)
-		if err == nil && request.Host.AuthDir != "" {
-			s.mu.Lock()
-			s.authDir = filepath.Clean(request.Host.AuthDir)
-			s.mu.Unlock()
+		if s.hostCredentialMode() {
+			return s.authParseHostMode(), nil
 		}
-		return result, err
-	case "management.register":
-		return s.registerSourceAuthManagement(raw)
-	case "management.handle":
-		return s.handleSourceAuthManagement(raw)
+		return parseAuthRequest(request)
+	case "model.route":
+		return s.routeModel(raw)
 	case "request.intercept_before":
 		return map[string]any{}, nil
 	case "request.intercept_after":
@@ -129,7 +126,21 @@ func (s *Service) Handle(method string, raw json.RawMessage) (any, error) {
 		return map[string]any{"Status": "error", "Message": "Import an existing CPA codex OAuth credential"}, nil
 	case "auth.refresh":
 		return authRefresh(raw)
-	case "model.register", "model.static", "model.for_auth":
+	case "model.static":
+		var request struct {
+			Host *struct{ ProxyURL string }
+		}
+		if err := json.Unmarshal(raw, &request); err != nil {
+			return nil, fail(400, "invalid_request", "invalid static model request")
+		}
+		if request.Host != nil {
+			s.mu.Lock()
+			s.hostProxyURL = request.Host.ProxyURL
+			s.hostReady = true
+			s.mu.Unlock()
+		}
+		return modelRegistration(s.config()), nil
+	case "model.register", "model.for_auth":
 		return modelRegistration(s.config()), nil
 	case "response.intercept_after":
 		return s.interceptModelCatalog(raw)
@@ -160,6 +171,12 @@ func (s *Service) execute(raw json.RawMessage, stream bool) (any, error) {
 	if err := json.Unmarshal(raw, &request); err != nil {
 		return nil, fail(400, "invalid_request", "executor request is invalid")
 	}
+	if s.hostCredentialMode() {
+		var err error
+		if request, err = s.withHostCredential(request); err != nil {
+			return nil, err
+		}
+	}
 	body, credential, hits, err := s.prepareRequestTracked(request)
 	if err != nil {
 		return nil, err
@@ -184,6 +201,7 @@ func (s *Service) executeResponse(request ExecutorRequest, body map[string]any, 
 		return nil, nil, nil, err
 	}
 	defer run.finish()
+	request.run = run
 	source, err := executorSource(request)
 	if err != nil {
 		return nil, nil, nil, err
@@ -261,6 +279,7 @@ func (s *Service) status() map[string]any {
 		"models":                       cfg.Models,
 		"model_mappings":               cfg.ModelMappings,
 		"upstream_transport":           cfg.UpstreamTransport,
+		"stream_tool_mode":             cfg.StreamToolMode,
 		"ws_handshake_timeout_seconds": cfg.WSHandshakeTimeoutSeconds,
 		"stopped":                      stopped,
 		"reasoning_efforts":            []string{"low", "medium", "high", "xhigh", "ultra"},
@@ -275,22 +294,25 @@ func registration(cfg Config) map[string]any {
 			"Version":          Version,
 			"Author":           "jaxson-wang",
 			"GitHubRepository": "https://github.com/JaxsonWang/cpa-plugin-oai-basispoints",
-			"Description":      "CPA Responses adapter for bps.openai.com with safe client-tool relay",
+			"Description":      "通过 CPA 的 Codex OAuth 凭据接入 Basis Points，安全转发客户端工具调用。",
 			"ConfigFields": []map[string]any{
 				{"Name": "upstream_transport", "Type": "string", "Description": "auto：仅凭据 websockets 已开启时优先 WS，握手失败可回退 HTTP/SSE；http：仅使用 HTTP/SSE。"},
+				{"Name": "stream_tool_mode", "Type": "string", "Description": "incremental（默认）：实时交付正文和摘要；buffered：本轮有可调用工具时等待整轮校验，可在交付前重生成一次，但首字延迟增大。"},
 				{"Name": "ws_handshake_timeout_seconds", "Type": "integer", "Description": "WS 单次握手上限，默认 5 秒；每轮生成只尝试一次。"},
-				{"Name": "responses_url", "Type": "string", "Description": "Basis Points Responses endpoint."},
+				{"Name": "responses_url", "Type": "string", "Description": "Basis Points 上游 Responses 接口地址，通常无需修改。"},
 				{"Name": "upstream_model", "Type": "string", "Description": "未单独配置 model_mappings 的别名使用的上游模型。"},
 				{"Name": "models", "Type": "array", "Description": "启用的客户端模型别名列表，数量不限。"},
 				{"Name": "model_mappings", "Type": "object", "Description": "客户端别名到实际上游模型的映射；键必须已列入 models。"},
-				{"Name": "timeout_seconds", "Type": "integer", "Description": "Upstream request timeout."},
-				{"Name": "max_response_bytes", "Type": "integer", "Description": "Maximum upstream response size."},
-				{"Name": "auth_mode", "Type": "string", "Description": "Basis Points authentication mode; normally chatgpt."},
-				{"Name": "tools_version_id", "Type": "string", "Description": "Optional authoritative Basis Points tools catalog version."},
+				{"Name": "timeout_seconds", "Type": "integer", "Description": "上游请求超时时间，单位为秒；默认 300，允许范围为 10～1800。"},
+				{"Name": "max_response_bytes", "Type": "integer", "Description": "上游响应体大小上限，单位为字节；默认 67108864（64 MiB）。"},
+				{"Name": "auth_mode", "Type": "string", "Description": "Basis Points 认证模式，通常保持 chatgpt。"},
+				{"Name": "tools_version_id", "Type": "string", "Description": "可选的 Basis Points 工具目录版本 ID，通常留空。"},
+				{"Name": "credential_source", "Type": "string", "Description": "host（默认）：Codex 文件交由 CPA 原生刷新和持久化，执行时读取宿主最新凭据；virtual：显式启用插件虚拟认证。"},
 			},
 		},
 		"capabilities": map[string]any{
-			"auth_provider":            true,
+			"auth_provider":            cfg.CredentialSource != CredentialSourceHost,
+			"model_router":             cfg.CredentialSource == CredentialSourceHost,
 			"model_provider":           true,
 			"executor":                 true,
 			"executor_model_scope":     "both",
@@ -299,7 +321,6 @@ func registration(cfg Config) map[string]any {
 			"response_interceptor":     true,
 			"request_interceptor":      true,
 			"request_lifecycle_plugin": true,
-			"management_api":           true,
 		},
 		"config": cfg,
 	}

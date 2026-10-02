@@ -31,26 +31,28 @@ type streamedReasoning struct {
 	doneSummary []any
 }
 
-// 提前交付普通消息和推理摘要；任何工具名称和参数均等待完整终态及整批校验。
+// 默认提前交付普通消息和推理摘要；工具回合可选择整轮校验后再交付。
+// 任何模式的工具名称和参数均等待完整终态及整批校验。
 type streamDelivery struct {
-	format        string
-	start         func()
-	write         func([]byte) error
-	committed     bool
-	disconnected  bool
-	sequence      int
-	meta          map[string]any
-	pending       []map[string]any
-	knownMessages map[int]string
-	knownParts    map[[2]int]bool
-	messages      map[int]*streamedMessage
-	reasonings    map[int]*streamedReasoning
-	terminal      bool
-	sentinel      bool
-	pacer         *deltaPacer
-	pacerStop     chan struct{}
-	pacerOnce     sync.Once
-	writeMu       sync.Mutex
+	format               string
+	start                func()
+	write                func([]byte) error
+	committed            bool
+	disconnected         bool
+	sequence             int
+	meta                 map[string]any
+	pending              []map[string]any
+	knownMessages        map[int]string
+	knownParts           map[[2]int]bool
+	messages             map[int]*streamedMessage
+	reasonings           map[int]*streamedReasoning
+	terminal             bool
+	sentinel             bool
+	bufferUntilValidated bool
+	pacer                *deltaPacer
+	pacerStop            chan struct{}
+	pacerOnce            sync.Once
+	writeMu              sync.Mutex
 	// stateMu 串行化读取协程与保活协程对交付状态的访问；重试只能 reset，不能整体替换结构体。
 	stateMu   sync.Mutex
 	lastWrite atomic.Int64
@@ -174,6 +176,11 @@ func (d *streamDelivery) consumeLocked(event, data string) error {
 	default:
 		// 工具增量及其他终态信息由完整响应保留，不作为正文暴露。
 		return nil
+	}
+	if d.bufferUntilValidated {
+		// 复用同一状态机核验缓冲事件，不提前提交，也不额外缓存一份事件队列。
+		_, err := d.applyEvent(value)
+		return err
 	}
 	if d.committed {
 		frame, err := d.applyEvent(value)
@@ -485,14 +492,14 @@ func (d *streamDelivery) applyMessageEvent(value map[string]any) (map[string]any
 	return frame, nil
 }
 
-// 终态必须与已交付文本相符；先核验这一点，再允许工具整批校验写入历史身份缓存。
+// 终态必须与已交付或缓冲校验的文本相符；之后才允许工具写入历史身份缓存。
 func (d *streamDelivery) validateFinal(response map[string]any) error {
 	d.stateMu.Lock()
 	defer d.stateMu.Unlock()
-	if !d.committed {
+	if !d.committed && !d.bufferUntilValidated {
 		return nil
 	}
-	if response["id"] != d.meta["id"] {
+	if d.meta != nil && response["id"] != d.meta["id"] {
 		return streamEventError()
 	}
 	output, _ := response["output"].([]any)

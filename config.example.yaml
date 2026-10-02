@@ -33,12 +33,19 @@ plugins:
         gpt-5.6-sol-basispoints: gpt-5.6-sol
 
       # auto：仅当前 CPA 凭据的 websockets 开关开启时优先 WS；每轮握手一次。
+      # 在 CPA 原生凭证设置中开启或关闭 websockets；插件不提供独立设置页。
       # 多账号分别按各自开关尝试，不限制同时启用的账号数量；能否返回 101 由上游决定。
       # 凭据开关关闭、缺失或无效时直接走 HTTP/SSE，不先握手，也不改写凭据。
       # 开启后的握手失败仍按下方规则回退原 HTTP/SSE。
       # http：主动关闭 WS，仅使用原有 HTTP 通道（流式为 SSE，非流式保持原语义）。
       # 401/403/407/429 不回退；WS 已建立有效连接后，不再换通道重放请求。
       upstream_transport: auto
+
+      # incremental（默认）：正文/推理摘要实时交付，已交付后工具失败不重生成。
+      # buffered：本轮有可调用工具时缓冲整轮，工具校验失败可在交付前重生成一次。
+      # 接受首字等待整轮完成（含可能的重生成）时才启用；不会重复交付失败尝试。
+      # 无工具或 tool_choice: none 仍实时交付；上游请求仍为流式且沿用大小/超时限制。
+      stream_tool_mode: incremental
 
       # 单次 WS 握手上限，单位：秒；范围：1～30，默认 5。
       # 不连续重试握手；下一轮请求重新优先尝试 WS。
@@ -79,6 +86,16 @@ plugins:
       # 可选：权威 Basis Points 工具目录版本 ID。默认留空，不发送版本标识。
       # 仅在已取得确切版本 ID 时填写，不要自行编造。
       tools_version_id: ""
+
+      # 凭据来源：host（默认）或显式选择 virtual；未配置或留空均为 host。
+      # virtual：插件接管 type: codex 文件，展开原生 + Basis Points 两条虚拟认证。
+      #   未修改的 CPA 不持久化虚拟认证的刷新结果：重启后会加载已轮换失效的 refresh_token，
+      #   Basis Points 记录也不跟随原生刷新，access_token 到期后需重新导入源凭据。
+      # host：插件不接管 Codex 文件，由 CPA 原生加载、刷新并写回源文件；执行 Basis Points
+      #   请求时通过 host.auth.get 读取宿主当前凭据，按顺序轮询未禁用的 Codex 认证。
+      #   别名模型由插件路由器直接交给本执行器，WS 和代理沿用 CPA 凭据及宿主设置。
+      #   不使用原生 Codex 通道的冷却，也不在生成失败后自动换号重放。
+      credential_source: host
 
       # 非敏感配置的持久化目录，默认值为 plugins/oai-basispoints-data。
       # 当前实现会先读取 YAML，再用此目录中已有的 settings.json 覆盖对应字段。

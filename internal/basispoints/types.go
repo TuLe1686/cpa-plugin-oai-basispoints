@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	Version        = "0.2.8.3"
+	Version        = "0.2.10.1"
 	Provider       = "oai-basispoints"
 	AuthProviderID = "codex"
 	PluginID       = Provider
@@ -18,6 +18,11 @@ const (
 	DefaultResponsesURL  = "https://bps.openai.com/basispoints/api/responses"
 	DefaultUpstreamModel = "gpt-6-astra"
 	DefaultModelID       = "gpt-6-astra-basispoints"
+
+	// CredentialSourceVirtual 由插件解析 Codex 文件并展开虚拟认证；CredentialSourceHost
+	// 交还宿主原生管理 Codex 文件，执行时再读取宿主维护的最新凭据。
+	CredentialSourceVirtual = "virtual"
+	CredentialSourceHost    = "host"
 )
 
 var supportedReasoningEfforts = map[string]struct{}{
@@ -83,6 +88,9 @@ type ExecutorRequest struct {
 	AuthAttributes  map[string]string `json:"AuthAttributes"`
 	StreamID        string            `json:"stream_id,omitempty"`
 	HostCallbackID  string            `json:"host_callback_id,omitempty"`
+	// 仅由插件选择宿主凭据后设置，不是宿主 ABI 或客户端可传入的字段。
+	credentialProxy *string
+	run             *runningStream
 }
 
 type ExecutorResponse struct {
@@ -106,6 +114,7 @@ type upstreamStream struct {
 	StatusCode int         `json:"status_code"`
 	Headers    http.Header `json:"headers"`
 	StreamID   string      `json:"stream_id"`
+	local      *credentialHTTPStream
 }
 
 type streamChunk struct {
@@ -116,6 +125,7 @@ type streamChunk struct {
 
 type Config struct {
 	UpstreamTransport         string            `yaml:"upstream_transport" json:"upstream_transport"`
+	StreamToolMode            string            `yaml:"stream_tool_mode" json:"stream_tool_mode"`
 	WSHandshakeTimeoutSeconds int               `yaml:"ws_handshake_timeout_seconds" json:"ws_handshake_timeout_seconds"`
 	DataDir                   string            `yaml:"data_dir" json:"data_dir"`
 	ResponsesURL              string            `yaml:"responses_url" json:"responses_url"`
@@ -132,11 +142,13 @@ type Config struct {
 	StreamKeepAliveSeconds    int               `yaml:"stream_keepalive_seconds" json:"stream_keepalive_seconds"`
 	CutoffCompletion          bool              `yaml:"cutoff_completion" json:"cutoff_completion"`
 	CacheWriteAsInput         bool              `yaml:"cache_write_as_input" json:"cache_write_as_input"`
+	CredentialSource          string            `yaml:"credential_source" json:"credential_source"`
 }
 
 func defaultConfig() Config {
 	return Config{
 		UpstreamTransport:         "auto",
+		StreamToolMode:            "incremental",
 		WSHandshakeTimeoutSeconds: 5,
 		DataDir:                   "plugins/oai-basispoints-data",
 		ResponsesURL:              DefaultResponsesURL,
@@ -149,6 +161,7 @@ func defaultConfig() Config {
 		SmoothChunkChars:          8,
 		SmoothIntervalMs:          20,
 		StreamKeepAliveSeconds:    45,
+		CredentialSource:          CredentialSourceHost,
 	}
 }
 
@@ -159,6 +172,10 @@ func (c *Config) normalize() error {
 	c.UpstreamTransport = strings.ToLower(strings.TrimSpace(c.UpstreamTransport))
 	if c.UpstreamTransport != "auto" && c.UpstreamTransport != "http" {
 		return fail(400, "invalid_config", "upstream_transport must be auto or http")
+	}
+	c.StreamToolMode = strings.ToLower(strings.TrimSpace(c.StreamToolMode))
+	if c.StreamToolMode != "incremental" && c.StreamToolMode != "buffered" {
+		return fail(400, "invalid_config", "stream_tool_mode must be incremental or buffered")
 	}
 	if c.WSHandshakeTimeoutSeconds < 1 || c.WSHandshakeTimeoutSeconds > 30 {
 		return fail(400, "invalid_config", "ws_handshake_timeout_seconds must be between 1 and 30")
@@ -174,6 +191,13 @@ func (c *Config) normalize() error {
 	c.UpstreamModel = strings.TrimSpace(c.UpstreamModel)
 	if c.UpstreamModel == "" {
 		c.UpstreamModel = DefaultUpstreamModel
+	}
+	c.CredentialSource = strings.ToLower(strings.TrimSpace(c.CredentialSource))
+	if c.CredentialSource == "" {
+		c.CredentialSource = CredentialSourceHost
+	}
+	if c.CredentialSource != CredentialSourceVirtual && c.CredentialSource != CredentialSourceHost {
+		return fail(400, "invalid_config", "credential_source must be virtual or host")
 	}
 	c.AuthMode = strings.TrimSpace(c.AuthMode)
 	if c.AuthMode == "" {
