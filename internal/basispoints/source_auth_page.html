@@ -32,6 +32,15 @@
   'use strict';
   const api = '/v0/management/oai-basispoints/source-auths';
   const storageKey = 'oai-basispoints.source-auths.management-key';
+  const SHARED_KEY = 'cpa-plugin-shared-mgmt-key';
+  const SIBLING_KEYS = [
+    'gateway_monitor_management_key',
+    'channel_monitor_management_key',
+    'channel_health_management_key',
+    'sub2api_balance_notify_management_key',
+    'capability-injector-mgmt-remembered',
+    SHARED_KEY
+  ];
   const keyInput = document.getElementById('key');
   const remember = document.getElementById('remember');
   const rows = document.getElementById('rows');
@@ -60,6 +69,14 @@
       throw new Error('浏览器拒绝保存管理密钥；当前连接仍可使用，但不能保证下次自动连接。');
     }
   }
+  function shareKey() {
+    /* 本页是凭证敏感页（上游安全门禁禁 session 级存储/跨 frame 消息/innerHTML），
+       共享键只走 localStorage——其他插件页 local 侧同样命中 */
+    try { localStorage.setItem(SHARED_KEY, key); } catch { }
+  }
+  function unshareKey() {
+    try { localStorage.removeItem(SHARED_KEY); } catch { }
+  }
   function forgetKey() {
     try {
       localStorage.removeItem(storageKey);
@@ -80,6 +97,7 @@
       authenticated = false;
       remember.checked = false;
       rows.replaceChildren();
+      unshareKey();
       forgetKey();
       throw new Error('管理鉴权失败，已清除保存的密钥，请重新输入正确的 CPA 管理密钥。');
     }
@@ -140,6 +158,7 @@
       const data = await request('GET');
       render(data.files);
       authenticated = true;
+      shareKey();
       const text = data.files.length ? '已读取 ' + data.files.length + ' 份源认证。' : '没有可编辑的根目录 Codex 源认证。';
       if (remember.checked) {
         try { saveKey(); }
@@ -180,18 +199,27 @@
     keyInput.value = '';
     remember.checked = false;
     rows.replaceChildren();
+    unshareKey();
     try { forgetKey(); message('已清除当前连接和保存的管理密钥。'); }
     catch (error) { message('当前连接已清除。' + error.message, true); }
     lock(false);
   });
-  try {
-    key = localStorage.getItem(storageKey) || '';
-    if (key) {
-      hasSavedKey = true;
-      remember.checked = true;
-      void load();
+  /* 自动连接：自己的键 → 共享键 → 兄弟插件键，逐个验证直到成功 */
+  (async () => {
+    const candidates = [];
+    const seen = new Set();
+    const push = v => { const s = String(v || '').trim(); if (s && !seen.has(s)) { seen.add(s); candidates.push(s); } };
+    try { push(localStorage.getItem(storageKey)); } catch { }
+    for (const name of SIBLING_KEYS) {
+      try { push(localStorage.getItem(name)); } catch { }
     }
-  } catch { message('无法读取浏览器保存的密钥，请手动输入以连接。', true); }
+    for (const candidate of candidates) {
+      key = candidate;
+      try { await load(); if (authenticated) return; } catch { }
+      key = '';
+    }
+    if (!candidates.length) message('请输入管理密钥；已在其他插件页连接过时会自动连接。');
+  })();
 })();
 </script>
 </body>
