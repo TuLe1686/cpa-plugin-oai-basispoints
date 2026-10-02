@@ -1,5 +1,13 @@
 # 更新日志
 
+## v0.2.8.3 — 2026-10-02（UTC+8，TuLe1686 fork）
+
+- 源认证页管理密钥跨插件共享：候选发现加共享键 `cpa-plugin-shared-mgmt-key` 与兄弟插件私键（gateway-monitor / channel-monitor / channel-health / sub2api-balance-notify / capability-injector，只读 localStorage）；验证成功写共享键，401 失效与「清除连接」同步清除。在任一插件页输入过密钥，本页即自动连接。
+- 本页为凭证敏感页（上游门禁禁 sessionStorage / 跨 frame 消息 / innerHTML，字符串扫描连注释都拦），共享键只走 localStorage。
+- us-biz 已部署（SHA-256 f2fb2688…d2df），浏览器实测从共享键自动连接并读取源认证。
+
+# 更新日志
+
 ## v0.2.8.2 — 2026-09-30（UTC+8，TuLe1686 fork）
 
 - 新增 `cache_write_as_input`（默认关闭）：打开后把下发给客户端的 `input_tokens_details.cache_write_tokens`（及 `prompt_tokens_details` 同名字段）置 0，`input_tokens`、`cached_tokens`、`total_tokens` 不变。Basis Points 首轮请求会把大部分输入报成缓存写入（实测 22374 输入里 22306 为写入），而这部分已计入 `input_tokens`；按缓存创建另行计价的下游会重复计费。参考 codex2api #744 的 `codex_basispoints_cache_creation_as_input`。
